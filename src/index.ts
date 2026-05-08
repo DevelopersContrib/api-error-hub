@@ -20,8 +20,6 @@
 
 export interface Env {
   DB: D1Database;
-  INGEST_API_KEY: string;
-  DASHBOARD_KEY: string;
   VNOC_API_URL: string;
   VNOC_API_KEY: string;
   SES_REGION: string;
@@ -75,24 +73,9 @@ function json(data: any, status = 200): Response {
   });
 }
 
-function getApiKey(request: Request): string {
-  return (
-    new URL(request.url).searchParams.get("key") ||
-    request.headers.get("X-API-Key") ||
-    request.headers.get("Authorization")?.replace("Bearer ", "") || ""
-  );
-}
-
-function isIngestKey(k: string, env: Env) { return k === env.INGEST_API_KEY || k === env.DASHBOARD_KEY; }
-function isDashKey(k: string, env: Env) { return k === env.DASHBOARD_KEY; }
-function isAnyKey(k: string, env: Env) { return k === env.INGEST_API_KEY || k === env.DASHBOARD_KEY; }
-
 // ── POST /ingest ────────────────────────────────────────────────────────────
 
 async function handleIngest(request: Request, env: Env): Promise<Response> {
-  const key = getApiKey(request);
-  if (!isIngestKey(key, env)) return json({ error: "Invalid API key" }, 401);
-
   let body: { api_source: string; errors: any[] };
   try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
   if (!body.api_source) return json({ error: "api_source required" }, 400);
@@ -122,8 +105,6 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
 // ── GET /logs ───────────────────────────────────────────────────────────────
 
 async function handleLogs(url: URL, env: Env, req: Request): Promise<Response> {
-  if (!isAnyKey(getApiKey(req), env)) return json({ error: "Unauthorized" }, 401);
-
   const source = url.searchParams.get("source") || "";
   const errorType = url.searchParams.get("type") || "";
   const endpoint = url.searchParams.get("endpoint") || "";
@@ -148,8 +129,6 @@ async function handleLogs(url: URL, env: Env, req: Request): Promise<Response> {
 // ── GET /summary ────────────────────────────────────────────────────────────
 
 async function handleSummary(url: URL, env: Env, req: Request): Promise<Response> {
-  if (!isAnyKey(getApiKey(req), env)) return json({ error: "Unauthorized" }, 401);
-
   const source = url.searchParams.get("source") || "";
   const hours = parseInt(url.searchParams.get("hours") || "24");
   const since = new Date(Date.now() - hours * 3600000).toISOString();
@@ -169,7 +148,6 @@ async function handleSummary(url: URL, env: Env, req: Request): Promise<Response
 // ── GET /sources ────────────────────────────────────────────────────────────
 
 async function handleSources(env: Env, req: Request): Promise<Response> {
-  if (!isAnyKey(getApiKey(req), env)) return json({ error: "Unauthorized" }, 401);
   const rows = await env.DB.prepare(`SELECT api_source, COUNT(*) as total, MAX(created_at) as last_error, COUNT(DISTINCT domain) as domains FROM error_logs GROUP BY api_source ORDER BY total DESC`).all();
   return json({ success: true, sources: rows.results });
 }
@@ -177,7 +155,6 @@ async function handleSources(env: Env, req: Request): Promise<Response> {
 // ── POST /clear ─────────────────────────────────────────────────────────────
 
 async function handleClear(req: Request, env: Env): Promise<Response> {
-  if (!isDashKey(getApiKey(req), env)) return json({ error: "Dashboard key required" }, 401);
   let body: { source?: string; older_than_hours?: number };
   try { body = await req.json(); } catch { body = {}; }
 
@@ -195,7 +172,6 @@ async function handleClear(req: Request, env: Env): Promise<Response> {
 // ── POST /send-digest (manual trigger) ──────────────────────────────────────
 
 async function handleManualDigest(env: Env, req: Request): Promise<Response> {
-  if (!isDashKey(getApiKey(req), env)) return json({ error: "Dashboard key required" }, 401);
   const result = await sendDailyDigest(env);
   return json(result);
 }
@@ -425,14 +401,12 @@ function esc(s: any): string { return String(s || "").replace(/&/g,"&amp;").repl
 // ── GET / — Dashboard HTML ──────────────────────────────────────────────────
 
 async function handleDashboard(env: Env, req: Request): Promise<Response> {
-  const key = getApiKey(req);
-  const authed = isAnyKey(key, env);
-  return new Response(dashboardHTML(authed ? key : ""), {
+  return new Response(dashboardHTML(), {
     headers: { "Content-Type": "text/html; charset=utf-8", ...CORS },
   });
 }
 
-function dashboardHTML(apiKey: string): string {
+function dashboardHTML(): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -447,8 +421,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .hdr .badge{background:#ef4444;color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600}
 .hdr .rt{margin-left:auto;display:flex;gap:8px;align-items:center}
 .cnt{max-width:1440px;margin:0 auto;padding:16px}
-.auth{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:16px}
-.auth input{background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:8px 12px;border-radius:6px;width:300px;margin-right:8px}
 .btn{background:#3b82f6;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500;font-size:13px}
 .btn:hover{background:#2563eb}
 .btn-red{background:#dc2626}.btn-red:hover{background:#b91c1c}
@@ -497,12 +469,7 @@ tr:hover td{background:#334155}
   </div>
 </div>
 <div class="cnt">
-  <div class="auth" id="authBox">
-    <div style="margin-bottom:6px;color:#94a3b8;font-size:12px">Enter your API key to view error logs</div>
-    <input type="password" id="keyInput" placeholder="Dashboard or ingest key..." value="${apiKey}">
-    <button class="btn" onclick="auth()">Connect</button>
-  </div>
-  <div id="dash" style="display:none">
+  <div id="dash">
     <div class="grid" id="statsRow"></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
       <div class="card"><div class="lb">Error Volume — Last 24h</div><div class="chart" id="hist"></div></div>
@@ -527,11 +494,11 @@ tr:hover td{background:#334155}
 </div>
 <div id="toast"></div>
 <script>
-const B=location.origin;let K='${apiKey}',off=0,tot=0,tab='logs';const L=50;
+const B=location.origin;let off=0,tot=0,tab='logs';const L=50;
 function toast(m,c='#22c55e'){const t=document.getElementById('toast');t.textContent=m;t.style.background=c;t.style.display='block';setTimeout(()=>t.style.display='none',3000)}
 function bc(t){return t==='error'||t==='internal_error'?'bt-err':t==='404'?'bt-404':t==='auth'?'bt-auth':t==='validation'?'bt-val':'bt-unk'}
-async function F(p,o={}){const s=p.includes('?')?'&':'?';return(await fetch(B+p+s+'key='+K,o)).json()}
-async function auth(){K=document.getElementById('keyInput').value;try{const d=await F('/sources');if(d.error){toast('Invalid key','#ef4444');return}document.getElementById('authBox').style.display='none';document.getElementById('dash').style.display='block';const s=document.getElementById('fSrc');s.innerHTML='<option value="">All Sources</option>';(d.sources||[]).forEach(r=>{const o=document.createElement('option');o.value=r.api_source;o.textContent=r.api_source+' ('+r.total+')';s.appendChild(o)});await Promise.all([stats(),load()])}catch(e){toast('Failed','#ef4444')}}
+async function F(p,o={}){return(await fetch(B+p,o)).json()}
+async function init(){try{const d=await F('/sources');const s=document.getElementById('fSrc');s.innerHTML='<option value="">All Sources</option>';(d.sources||[]).forEach(r=>{const o=document.createElement('option');o.value=r.api_source;o.textContent=r.api_source+' ('+r.total+')';s.appendChild(o)});await Promise.all([stats(),load()])}catch(e){toast('Failed to load','#ef4444')}}
 async function stats(){const src=document.getElementById('fSrc').value;const d=await F('/summary?hours=24'+(src?'&source='+src:''));if(!d.success)return;document.getElementById('totalBadge').textContent=d.total+' errors';
 const errs=(d.by_source||[]).filter(r=>r.error_type==='error'||r.error_type==='internal_error').reduce((a,r)=>a+r.count,0);
 const nf=(d.by_source||[]).filter(r=>r.error_type==='404'||r.error_type==='unknown_controller'||r.error_type==='unknown_action').reduce((a,r)=>a+r.count,0);
@@ -557,6 +524,6 @@ function pg(d){off=Math.max(0,off+d*L);load()}
 async function clearL(){const src=document.getElementById('fSrc').value;if(!src){toast('Select a source','#d97706');return}if(!confirm('Clear all logs for '+src+'?'))return;const d=await F('/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:src})});if(d.success){toast('Cleared '+d.deleted);off=0;load()}else toast(d.error||'Failed','#ef4444')}
 async function sendDigest(){if(!confirm('Send error digest email now?'))return;const d=await F('/send-digest',{method:'POST'});toast(d.message||'Done',d.success?'#22c55e':'#ef4444')}
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-if(K)auth();
+init();
 </script></body></html>`;
 }
