@@ -8,24 +8,13 @@ account_id = "8cff55b678de16d75a95167d112e7831"
 # Or use: wrangler domains add log.vnoc.com
 
 [vars]
-# API key that all projects use to POST errors
-INGEST_API_KEY = "errhub_k8x2mNqP7vRtYwZs4jL6"
-# Master key for dashboard access
-DASHBOARD_KEY = "errhub_dash_Fk9xMwQp3nVtRz7s"
 # VNOC API for domain info
 VNOC_API_URL = "https://manage.vnoc.com"
 VNOC_API_KEY = "b102e32a4bf14b575f352186e265ed7c7272cde4ded39f0c478530f6b358c9c4"
-# AWS SES for email alerts
-SES_REGION = "us-west-2"
-SES_FROM = "VentureOS Error Hub <noreply@vnoc.com>"
+# Resend for email alerts
+RESEND_API_KEY = "re_fBcrxGWe_Q22pnqbFd9euHVh8DNRfZag4"
+RESEND_FROM = "VentureOS Error Hub <noreply@vnoc.com>"
 ALERT_RECIPIENTS = "maida@vnoc.com,kjabellar@gmail.com,rownone@gmail.com"
-
-# AWS SES credentials — set as secrets after deploy:
-#   wrangler secret put AWS_ACCESS_KEY_ID
-#   wrangler secret put AWS_SECRET_ACCESS_KEY
-# [secrets]
-# AWS_ACCESS_KEY_ID = ""
-# AWS_SECRET_ACCESS_KEY = ""
 
 [[d1_databases]]
 binding = "DB"

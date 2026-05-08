@@ -1,7 +1,7 @@
 /**
  * log.vnoc.com — VentureOS Centralized Error Hub
  *
- * Cloudflare Worker + D1 + AWS SES
+ * Cloudflare Worker + D1 + Resend
  *
  * All API projects POST errors here → one dashboard, daily email digests.
  *
@@ -15,18 +15,16 @@
  *   GET  /health          — Health check
  *   POST /send-digest     — Trigger email digest manually (dashboard key)
  *
- * Cron: daily at 8 AM UTC → sends digest email via AWS SES
+ * Cron: daily at 8 AM UTC → sends digest email via Resend
  */
 
 export interface Env {
   DB: D1Database;
   VNOC_API_URL: string;
   VNOC_API_KEY: string;
-  SES_REGION: string;
-  SES_FROM: string;
+  RESEND_API_KEY: string;
+  RESEND_FROM: string;
   ALERT_RECIPIENTS: string;
-  AWS_ACCESS_KEY_ID?: string;
-  AWS_SECRET_ACCESS_KEY?: string;
 }
 
 const CORS: Record<string, string> = {
@@ -176,17 +174,15 @@ async function handleManualDigest(env: Env, req: Request): Promise<Response> {
   return json(result);
 }
 
-// ── AWS SES Email ───────────────────────────────────────────────────────────
+// ── Resend Email ───────────────────────────────────────────────────────────
 
 async function sendDailyDigest(env: Env): Promise<{ success: boolean; message: string }> {
   const hours = 24;
   const since = new Date(Date.now() - hours * 3600000).toISOString();
 
-  // Get summary data
   const total = await env.DB.prepare("SELECT COUNT(*) as total FROM error_logs WHERE created_at >= ?").bind(since).first<{total:number}>();
   const totalCount = total?.total || 0;
 
-  // Skip if no errors
   if (totalCount === 0) {
     await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, 0, 0, 24, 'skipped')").bind(env.ALERT_RECIPIENTS).run();
     return { success: true, message: "No errors in last 24h — skipped" };
@@ -198,123 +194,50 @@ async function sendDailyDigest(env: Env): Promise<{ success: boolean; message: s
 
   const criticalCount = (bySrc.results || []).filter((r: any) => r.error_type === 'error' || r.error_type === 'internal_error').reduce((a: number, r: any) => a + r.count, 0);
 
-  // Build HTML email
   const html = buildDigestEmail(totalCount, criticalCount, bySrc.results || [], topEp.results || [], byDomain.results || [], hours);
 
   const subject = criticalCount > 50
-    ? `🔴 CRITICAL: ${criticalCount} server errors in last ${hours}h — VentureOS`
+    ? `CRITICAL: ${criticalCount} server errors in last ${hours}h — VentureOS`
     : criticalCount > 0
-    ? `⚠️ ${totalCount} API errors in last ${hours}h — VentureOS`
-    : `📊 ${totalCount} API events in last ${hours}h — VentureOS`;
+    ? `${totalCount} API errors in last ${hours}h — VentureOS`
+    : `${totalCount} API events in last ${hours}h — VentureOS`;
 
   const recipients = env.ALERT_RECIPIENTS.split(",").map(e => e.trim()).filter(Boolean);
 
-  if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) {
+  if (!env.RESEND_API_KEY) {
     await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
-    return { success: false, message: "AWS SES credentials not configured. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as worker secrets." };
+    return { success: false, message: "RESEND_API_KEY not configured." };
   }
 
   try {
-    await sendSESEmail(env, recipients, subject, html);
+    await sendResendEmail(env, recipients, subject, html);
     await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'sent')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
     return { success: true, message: `Digest sent to ${recipients.length} recipients (${totalCount} errors, ${criticalCount} critical)` };
   } catch (err: any) {
     await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
-    return { success: false, message: `SES send failed: ${err.message}` };
+    return { success: false, message: `Resend failed: ${err.message}` };
   }
 }
 
-async function sendSESEmail(env: Env, to: string[], subject: string, htmlBody: string): Promise<void> {
-  const region = env.SES_REGION || "us-west-2";
-  const host = `email.${region}.amazonaws.com`;
-  const endpoint = `https://${host}/v2/email/outbound-emails`;
-
-  const body = JSON.stringify({
-    FromEmailAddress: env.SES_FROM,
-    Destination: { ToAddresses: to },
-    Content: {
-      Simple: {
-        Subject: { Data: subject, Charset: "UTF-8" },
-        Body: { Html: { Data: htmlBody, Charset: "UTF-8" } },
-      },
-    },
-  });
-
-  const now = new Date();
-  const dateStamp = now.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
-  const shortDate = dateStamp.substring(0, 8);
-
-  // AWS Signature V4
-  const credentialScope = `${shortDate}/${region}/ses/aws4_request`;
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Host: host,
-    "X-Amz-Date": dateStamp,
-  };
-
-  const signedHeaderKeys = Object.keys(headers).sort().map(k => k.toLowerCase());
-  const signedHeadersStr = signedHeaderKeys.join(";");
-
-  const canonicalHeaders = signedHeaderKeys.map(k => `${k}:${headers[k.charAt(0).toUpperCase() + k.slice(1)] || headers[k]}`).join("\n") + "\n";
-
-  const payloadHash = await sha256Hex(body);
-
-  const canonicalRequest = [
-    "POST",
-    "/v2/email/outbound-emails",
-    "",
-    canonicalHeaders,
-    signedHeadersStr,
-    payloadHash,
-  ].join("\n");
-
-  const stringToSign = [
-    "AWS4-HMAC-SHA256",
-    dateStamp,
-    credentialScope,
-    await sha256Hex(canonicalRequest),
-  ].join("\n");
-
-  const signingKey = await getSignatureKey(env.AWS_SECRET_ACCESS_KEY!, shortDate, region, "ses");
-  const signature = await hmacHex(signingKey, stringToSign);
-
-  const authHeader = `AWS4-HMAC-SHA256 Credential=${env.AWS_ACCESS_KEY_ID}/${credentialScope}, SignedHeaders=${signedHeadersStr}, Signature=${signature}`;
-
-  const resp = await fetch(endpoint, {
+async function sendResendEmail(env: Env, to: string[], subject: string, html: string): Promise<void> {
+  const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
-    headers: { ...headers, Authorization: authHeader },
-    body,
+    headers: {
+      "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: env.RESEND_FROM,
+      to,
+      subject,
+      html,
+    }),
   });
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`SES ${resp.status}: ${errText.substring(0, 500)}`);
+    throw new Error(`Resend ${resp.status}: ${errText.substring(0, 500)}`);
   }
-}
-
-// AWS Sig V4 helpers
-async function sha256Hex(data: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function hmacSha256(key: ArrayBuffer, data: string): Promise<ArrayBuffer> {
-  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
-}
-
-async function hmacHex(key: ArrayBuffer, data: string): Promise<string> {
-  const buf = await hmacSha256(key, data);
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function getSignatureKey(secretKey: string, dateStamp: string, region: string, service: string): Promise<ArrayBuffer> {
-  let key = await hmacSha256(new TextEncoder().encode("AWS4" + secretKey).buffer as ArrayBuffer, dateStamp);
-  key = await hmacSha256(key, region);
-  key = await hmacSha256(key, service);
-  key = await hmacSha256(key, "aws4_request");
-  return key;
 }
 
 // ── Email template ──────────────────────────────────────────────────────────
