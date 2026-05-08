@@ -15,6 +15,8 @@ VNOC_API_KEY = "b102e32a4bf14b575f352186e265ed7c7272cde4ded39f0c478530f6b358c9c4
 RESEND_API_KEY = "re_fBcrxGWe_Q22pnqbFd9euHVh8DNRfZag4"
 RESEND_FROM = "VNOC Error Hub <noreply@send.vnoc.com>"
 ALERT_RECIPIENTS = "maida@vnoc.com,kjabellar@gmail.com,rownone@gmail.com"
+INGEST_KEY = "vnoc-hub-2024-ingest-k8x9m2"
+ALLOWED_EMAILS = "admin@domaindirectory.com,kjabellar@gmail.com,rownone@gmail.com,maidabarrientos@gmail.com,chad@ecorp.com,ecorpcom@gmail.com"
 
 [ai]
 binding = "AI"

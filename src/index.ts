@@ -6,18 +6,27 @@
  * All API projects POST errors here → one dashboard, daily email digests.
  *
  * Routes:
- *   POST /ingest          — Log errors (ingest key)
- *   GET  /logs            — Query raw logs
- *   GET  /summary         — Aggregated stats
- *   GET  /sources         — List API sources
- *   POST /clear           — Clear logs
- *   GET  /                — Dashboard HTML
- *   GET  /health          — Health check
- *   POST /send-digest     — Trigger email digest manually (dashboard key)
- *   POST /analyze         — AI-powered single error analysis (CF Workers AI)
- *   GET  /agent           — Error Log Agent chat page
- *   POST /agent/chat      — Agent chat API (context-aware, multi-turn)
- *   GET  /install         — One-click setup page for new projects
+ *   PUBLIC:
+ *     GET  /health          — Health check
+ *     GET  /install         — One-click setup page for new projects
+ *     GET  /login           — Magic link login page
+ *     POST /login           — Request magic link
+ *     GET  /auth/verify     — Verify magic link token
+ *     GET  /logout          — Clear session
+ *
+ *   API KEY (X-API-Key header):
+ *     POST /ingest          — Log errors (machine-to-machine)
+ *
+ *   SESSION (magic link cookie):
+ *     GET  /                — Dashboard HTML
+ *     GET  /logs            — Query raw logs
+ *     GET  /summary         — Aggregated stats
+ *     GET  /sources         — List API sources
+ *     POST /clear           — Clear logs
+ *     POST /send-digest     — Trigger email digest
+ *     POST /analyze         — AI single error analysis
+ *     GET  /agent           — Error Log Agent chat page
+ *     POST /agent/chat      — Agent chat API
  *
  * Cron: daily at 8 AM UTC → sends digest email via Resend
  */
@@ -30,6 +39,8 @@ export interface Env {
   RESEND_API_KEY: string;
   RESEND_FROM: string;
   ALERT_RECIPIENTS: string;
+  INGEST_KEY: string;
+  ALLOWED_EMAILS: string;
 }
 
 const CORS: Record<string, string> = {
@@ -48,7 +59,30 @@ export default {
     const path = url.pathname;
 
     try {
-      if (path === "/ingest" && request.method === "POST") return handleIngest(request, env);
+      // ── Public routes ──
+      if (path === "/health") return json({ status: "ok", ts: new Date().toISOString() });
+      if (path === "/install") return handleInstall();
+      if (path === "/login" && request.method === "GET") return handleLoginPage();
+      if (path === "/login" && request.method === "POST") return handleLoginSubmit(request, env);
+      if (path === "/auth/verify") return handleVerify(url, env);
+      if (path === "/logout") return handleLogout();
+
+      // ── API-key protected (machine-to-machine) ──
+      if (path === "/ingest" && request.method === "POST") {
+        const key = request.headers.get("X-API-Key") || "";
+        if (key !== env.INGEST_KEY) return json({ error: "Invalid API key" }, 401);
+        return handleIngest(request, env);
+      }
+
+      // ── Session-protected routes ──
+      const session = await getSession(request, env);
+      if (!session) {
+        // API calls get 401 JSON; page requests get redirected to login
+        const isAPI = request.headers.get("accept")?.includes("application/json") || request.method === "POST";
+        if (isAPI) return json({ error: "Unauthorized — please login at /login" }, 401);
+        return Response.redirect(new URL("/login", url.origin).toString(), 302);
+      }
+
       if (path === "/logs") return handleLogs(url, env, request);
       if (path === "/summary") return handleSummary(url, env, request);
       if (path === "/sources") return handleSources(env, request);
@@ -57,9 +91,7 @@ export default {
       if (path === "/analyze" && request.method === "POST") return handleAnalyze(request, env);
       if (path === "/agent/chat" && request.method === "POST") return handleAgentChat(request, env);
       if (path === "/agent") return handleAgentPage();
-      if (path === "/install") return handleInstall();
-      if (path === "/health") return json({ status: "ok", ts: new Date().toISOString() });
-      if (path === "/" || path === "/dashboard") return handleDashboard(env, request);
+      if (path === "/" || path === "/dashboard") return handleDashboard(env, request, session);
       return json({ error: "Not found" }, 404);
     } catch (err: any) {
       return json({ error: err.message || "Internal error" }, 500);
@@ -77,6 +109,198 @@ export default {
 function json(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status, headers: { "Content-Type": "application/json", ...CORS },
+  });
+}
+
+// ── Auth: Magic Link ───────────────────────────────────────────────────────
+
+function generateToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function parseCookies(req: Request): Record<string, string> {
+  const hdr = req.headers.get("cookie") || "";
+  const out: Record<string, string> = {};
+  for (const part of hdr.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k) out[k.trim()] = v.join("=").trim();
+  }
+  return out;
+}
+
+async function getSession(req: Request, env: Env): Promise<string | null> {
+  const cookies = parseCookies(req);
+  const sid = cookies["hub_session"];
+  if (!sid) return null;
+  const row = await env.DB.prepare(
+    "SELECT email FROM auth_sessions WHERE id = ? AND type = 'session' AND expires_at > datetime('now')"
+  ).bind(sid).first<{ email: string }>();
+  return row?.email || null;
+}
+
+function sessionCookie(sid: string, maxAge: number): string {
+  return `hub_session=${sid}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+}
+
+// ── GET /login ─────────────────────────────────────────────────────────────
+
+function handleLoginPage(msg?: string, msgType?: string): Response {
+  const html = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — VNOC Error Hub</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:40px;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.logo{text-align:center;margin-bottom:24px}
+.logo img{height:32px}
+h1{text-align:center;font-size:20px;font-weight:700;margin-bottom:6px}
+.sub{text-align:center;color:#94a3b8;font-size:13px;margin-bottom:28px}
+label{display:block;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+input[type="email"]{width:100%;background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:12px 16px;border-radius:10px;font-size:15px;outline:none;transition:border-color .2s}
+input[type="email"]:focus{border-color:#7c3aed}
+button{width:100%;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;border:none;padding:12px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;margin-top:16px;transition:opacity .15s}
+button:hover{opacity:.9}
+button:disabled{opacity:.5;cursor:wait}
+.msg{text-align:center;padding:10px;border-radius:8px;margin-bottom:16px;font-size:13px}
+.msg-ok{background:#064e3b;color:#6ee7b7;border:1px solid #059669}
+.msg-err{background:#450a0a;color:#fca5a5;border:1px solid #dc2626}
+.footer{text-align:center;margin-top:20px;color:#64748b;font-size:11px}
+.footer a{color:#7c3aed;text-decoration:none}
+.how{margin-top:20px;padding:14px;background:#0f172a;border-radius:8px;border:1px solid #334155}
+.how h3{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.how p{font-size:12px;color:#94a3b8;line-height:1.5}
+</style></head><body>
+<div class="card">
+<div class="logo"><img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC"></div>
+<h1>Error Log Hub</h1>
+<div class="sub">Sign in with your email — no password needed</div>
+${msg ? `<div class="msg msg-${msgType || "ok"}">${msg}</div>` : ""}
+<form method="POST" action="/login" id="loginForm">
+<label>Email Address</label>
+<input type="email" name="email" id="emailInput" placeholder="you@company.com" required autofocus>
+<button type="submit" id="submitBtn">Send Magic Link ✨</button>
+</form>
+<div class="how">
+<h3>How it works</h3>
+<p>Enter your email and we'll send you a secure login link. Click it and you're in — no password required. Links expire in 15 minutes.</p>
+</div>
+<div class="footer"><a href="/install">Install Guide</a></div>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit',function(){
+document.getElementById('submitBtn').disabled=true;
+document.getElementById('submitBtn').textContent='Sending...';
+});
+</script>
+</body></html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// ── POST /login ────────────────────────────────────────────────────────────
+
+async function handleLoginSubmit(request: Request, env: Env): Promise<Response> {
+  let email = "";
+  const ct = request.headers.get("content-type") || "";
+  if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+    const fd = await request.formData();
+    email = (fd.get("email") as string || "").trim().toLowerCase();
+  } else {
+    try { const b = await request.json() as any; email = (b.email || "").trim().toLowerCase(); } catch {}
+  }
+
+  if (!email) return handleLoginPage("Please enter an email address.", "err");
+
+  const allowed = (env.ALLOWED_EMAILS || "").split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+  if (!allowed.includes(email)) {
+    return handleLoginPage("This email is not authorized to access the error hub.", "err");
+  }
+
+  // Generate magic link token (15 min expiry)
+  const token = generateToken();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO auth_sessions (id, email, type, expires_at) VALUES (?, ?, 'magic_link', ?)"
+  ).bind(token, email, expiresAt).run();
+
+  // Build magic link
+  const origin = new URL(request.url).origin;
+  const magicLink = `${origin}/auth/verify?token=${token}`;
+
+  // Send via Resend
+  try {
+    await sendResendEmail(env, [email], "Your VNOC Error Hub Login Link", `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8fafc;padding:20px;color:#1e293b">
+<div style="max-width:500px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+<div style="background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;text-align:center">
+<img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:28px;margin-bottom:8px">
+<div style="color:#f8fafc;font-size:18px;font-weight:700">Error Log Hub</div>
+</div>
+<div style="padding:28px 24px;text-align:center">
+<p style="color:#64748b;font-size:14px;margin-bottom:20px">Click the button below to sign in. This link expires in 15 minutes.</p>
+<a href="${magicLink}" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:600;font-size:16px">Sign In to Error Hub →</a>
+<p style="color:#94a3b8;font-size:12px;margin-top:20px">If you didn't request this, you can safely ignore this email.</p>
+</div>
+<div style="background:#f1f5f9;padding:12px 24px;text-align:center;color:#94a3b8;font-size:11px">
+VNOC Error Hub — log.vnoc.com
+</div>
+</div></body></html>`);
+  } catch (err: any) {
+    return handleLoginPage(`Failed to send email: ${err.message}`, "err");
+  }
+
+  // Clean up expired tokens
+  await env.DB.prepare("DELETE FROM auth_sessions WHERE expires_at < datetime('now')").run();
+
+  return handleLoginPage(`Magic link sent to <strong>${email}</strong> — check your inbox!`, "ok");
+}
+
+// ── GET /auth/verify ───────────────────────────────────────────────────────
+
+async function handleVerify(url: URL, env: Env): Promise<Response> {
+  const token = url.searchParams.get("token") || "";
+  if (!token) return handleLoginPage("Invalid or missing token.", "err");
+
+  // Look up token
+  const row = await env.DB.prepare(
+    "SELECT email FROM auth_sessions WHERE id = ? AND type = 'magic_link' AND expires_at > datetime('now')"
+  ).bind(token).first<{ email: string }>();
+
+  if (!row) return handleLoginPage("This link has expired or is invalid. Please request a new one.", "err");
+
+  // Delete the magic link token (one-time use)
+  await env.DB.prepare("DELETE FROM auth_sessions WHERE id = ?").bind(token).run();
+
+  // Create session (7 days)
+  const sessionId = generateToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO auth_sessions (id, email, type, expires_at) VALUES (?, ?, 'session', ?)"
+  ).bind(sessionId, row.email, expiresAt).run();
+
+  // Set cookie and redirect to dashboard
+  return new Response(null, {
+    status: 302,
+    headers: {
+      "Location": "/",
+      "Set-Cookie": sessionCookie(sessionId, 7 * 24 * 60 * 60),
+    },
+  });
+}
+
+// ── GET /logout ────────────────────────────────────────────────────────────
+
+async function handleLogout(): Promise<Response> {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      "Location": "/login",
+      "Set-Cookie": sessionCookie("", 0), // expire the cookie
+    },
   });
 }
 
@@ -886,7 +1110,7 @@ pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;o
   <div class="test-box">
     <h4>✅ Test It</h4>
     <p style="color:#d1fae5;font-size:13px;margin-bottom:8px">After deploying, send a test error:</p>
-    <code id="testCmd">curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -d '{"api_source":"api-myproject","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}'</code>
+    <code id="testCmd">curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -H "X-API-Key: vnoc-hub-2024-ingest-k8x9m2" -d '{"api_source":"api-myproject","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}'</code>
   </div>
 </div>
 
@@ -896,10 +1120,11 @@ function selFw(f,el){fw=f;document.querySelectorAll('.fw-btn').forEach(b=>b.clas
 
 function gen(){
 const name=document.getElementById('projName').value.trim()||'api-myproject';
-document.getElementById('testCmd').textContent='curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -d \\'{"api_source":"'+name+'","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}\\'';
+document.getElementById('testCmd').textContent='curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -H "X-API-Key: vnoc-hub-2024-ingest-k8x9m2" -d \\'{"api_source":"'+name+'","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}\\'';
 
 if(fw==='nextjs'){
 document.getElementById('output').innerHTML=codeBlock('src/lib/error-hub.ts',\`const HUB_URL = process.env.ERROR_HUB_URL || "https://log.vnoc.com";
+const HUB_KEY = process.env.ERROR_HUB_KEY || "vnoc-hub-2024-ingest-k8x9m2";
 const API_SOURCE = process.env.ERROR_HUB_SOURCE || "\${name}";
 
 interface HubError {
@@ -917,7 +1142,7 @@ export function sendToHub(entry: HubError): void {
   if (!HUB_URL) return;
   fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-API-Key": HUB_KEY },
     body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
   }).catch(() => {});
 }
@@ -979,10 +1204,12 @@ export async function POST(req: Request) {
     return Response.json({ success: false }, { status: 500 });
   }
 }\`)+\`<p style="color:#94a3b8;font-size:13px;margin-top:12px">Optional: add to <code style="color:#e2e8f0">.env.local</code></p>\`+codeBlock('.env.local',\`ERROR_HUB_URL=https://log.vnoc.com
+ERROR_HUB_KEY=vnoc-hub-2024-ingest-k8x9m2
 ERROR_HUB_SOURCE=\${name}\`);
 
 }else if(fw==='worker'){
 document.getElementById('output').innerHTML=codeBlock('src/error-hub.ts',\`const HUB_URL = "https://log.vnoc.com";
+const HUB_KEY = "vnoc-hub-2024-ingest-k8x9m2";
 const API_SOURCE = "\${name}";
 
 interface HubError {
@@ -999,7 +1226,7 @@ interface HubError {
 export function sendToHub(entry: HubError): void {
   fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-API-Key": HUB_KEY },
     body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
   }).catch(() => {});
 }
@@ -1041,13 +1268,14 @@ export default {
 
 }else{
 document.getElementById('output').innerHTML=codeBlock('lib/error-hub.js',\`const HUB_URL = process.env.ERROR_HUB_URL || "https://log.vnoc.com";
+const HUB_KEY = process.env.ERROR_HUB_KEY || "vnoc-hub-2024-ingest-k8x9m2";
 const API_SOURCE = process.env.ERROR_HUB_SOURCE || "\${name}";
 
 async function sendToHub(entry) {
   try {
     await fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-API-Key": HUB_KEY },
       body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
     });
   } catch {}
@@ -1082,13 +1310,13 @@ gen();
 
 // ── GET / — Dashboard HTML ──────────────────────────────────────────────────
 
-async function handleDashboard(env: Env, req: Request): Promise<Response> {
-  return new Response(dashboardHTML(), {
+async function handleDashboard(env: Env, req: Request, email: string): Promise<Response> {
+  return new Response(dashboardHTML(email), {
     headers: { "Content-Type": "text/html; charset=utf-8", ...CORS },
   });
 }
 
-function dashboardHTML(): string {
+function dashboardHTML(email: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1151,7 +1379,8 @@ tr:hover td{background:#334155}
     <a href="/agent" class="btn" style="background:#7c3aed;text-decoration:none" title="Chat with the Error Log Agent">🤖 Agent</a>
     <a href="/install" class="btn btn-ghost" title="Add a new project" style="text-decoration:none">🔌 Install</a>
     <button class="btn btn-green" onclick="sendDigest()" title="Send email digest now">📧 Send Digest</button>
-    <span class="sub">VNOC Error Hub</span>
+    <span class="sub" style="font-size:11px;color:#94a3b8">${esc(email)}</span>
+    <a href="/logout" class="btn btn-ghost" style="text-decoration:none;font-size:11px;padding:4px 10px">Logout</a>
   </div>
 </div>
 <div class="cnt">
