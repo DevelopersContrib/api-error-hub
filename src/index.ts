@@ -346,6 +346,7 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 <div style="max-width:650px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
 
 <div style="background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;color:#f8fafc">
+  <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:30px;margin-bottom:8px">
   <div style="font-size:20px;font-weight:700">VentureOS Error Hub</div>
   <div style="color:#94a3b8;font-size:13px;margin-top:4px">Daily Digest — ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</div>
 </div>
@@ -460,7 +461,7 @@ tr:hover td{background:#334155}
 </head>
 <body>
 <div class="hdr">
-  <svg width="22" height="22" fill="none" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:28px">
   <h1>log.vnoc.com</h1>
   <span class="badge" id="totalBadge">—</span>
   <div class="rt">
