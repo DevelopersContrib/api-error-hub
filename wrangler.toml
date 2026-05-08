@@ -26,6 +26,7 @@ binding = "DB"
 database_name = "api-error-hub-db"
 database_id = "ea90fd11-af41-41f8-92c3-a29e95fc59f7"
 
-# Daily cron: send error digest email at 8 AM UTC (4 AM ET)
+# Weekly cron: send error digest email every Tuesday at 8 AM UTC (4 AM ET)
+# Critical alerts are sent in real-time when AI detects critical errors or error spikes occur
 [triggers]
-crons = ["0 8 * * *"]
+crons = ["0 8 * * 2"]

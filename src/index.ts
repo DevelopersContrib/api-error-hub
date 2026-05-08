@@ -3,7 +3,7 @@
  *
  * Cloudflare Worker + D1 + Resend
  *
- * All API projects POST errors here → one dashboard, daily email digests.
+ * All API projects POST errors here → one dashboard, weekly + critical email alerts.
  *
  * Routes:
  *   PUBLIC:
@@ -28,7 +28,8 @@
  *     GET  /agent           — Error Log Agent chat page
  *     POST /agent/chat      — Agent chat API
  *
- * Cron: daily at 8 AM UTC → sends digest email via Resend
+ * Cron: Weekly Tuesday 8 AM UTC → sends digest email via Resend
+ * Real-time: Critical alerts fire immediately when AI detects critical errors or error spikes occur
  */
 
 export interface Env {
@@ -98,9 +99,9 @@ export default {
     }
   },
 
-  // Cron trigger: daily error digest
+  // Cron trigger: weekly Tuesday digest
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(sendDailyDigest(env));
+    ctx.waitUntil(sendWeeklyDigest(env));
   },
 };
 
@@ -330,6 +331,11 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   );
 
   await env.DB.batch(stmts);
+
+  // Fire-and-forget: check for error spikes → critical alert
+  const hasServerErrors = body.errors.some((e: any) => e.error_type === "error" || e.error_type === "internal_error");
+  if (hasServerErrors) checkErrorSpike(env).catch(() => {});
+
   return json({ success: true, logged: body.errors.length });
 }
 
@@ -451,6 +457,17 @@ Respond in this exact JSON format (no markdown, no code fences):
         severity: "medium",
         category: "uncategorized",
       };
+    }
+
+    // Fire critical alert if AI says this is critical
+    if (analysis.severity === "critical") {
+      maybeSendCriticalAlert(env, `AI flagged critical error: ${body.api_source || "unknown"} ${body.endpoint || ""}`, {
+        api_source: body.api_source,
+        endpoint: body.endpoint,
+        message: body.message,
+        diagnosis: analysis.diagnosis,
+        suggested_fix: analysis.suggested_fix,
+      }).catch(() => {});
     }
 
     return json({ success: true, analysis });
@@ -578,22 +595,23 @@ When the conversation starts, give a brief status overview if the user hasn't as
 // ── POST /send-digest (manual trigger) ──────────────────────────────────────
 
 async function handleManualDigest(env: Env, req: Request): Promise<Response> {
-  const result = await sendDailyDigest(env);
+  const result = await sendWeeklyDigest(env);
   return json(result);
 }
 
-// ── Resend Email ───────────────────────────────────────────────────────────
+// ── Resend Email + Alerting ───────────────────────────────────────────────
 
-async function sendDailyDigest(env: Env): Promise<{ success: boolean; message: string }> {
-  const hours = 24;
+/** Weekly digest — runs every Tuesday via cron, or manually via /send-digest */
+async function sendWeeklyDigest(env: Env): Promise<{ success: boolean; message: string }> {
+  const hours = 168; // 7 days
   const since = new Date(Date.now() - hours * 3600000).toISOString();
 
   const total = await env.DB.prepare("SELECT COUNT(*) as total FROM error_logs WHERE created_at >= ?").bind(since).first<{total:number}>();
   const totalCount = total?.total || 0;
 
   if (totalCount === 0) {
-    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, 0, 0, 24, 'skipped')").bind(env.ALERT_RECIPIENTS).run();
-    return { success: true, message: "No errors in last 24h — skipped" };
+    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, 0, 0, ?, 'skipped')").bind(env.ALERT_RECIPIENTS, hours).run();
+    return { success: true, message: "No errors in last 7 days — skipped" };
   }
 
   const bySrc = await env.DB.prepare("SELECT api_source, error_type, COUNT(*) as count FROM error_logs WHERE created_at >= ? GROUP BY api_source, error_type ORDER BY count DESC").bind(since).all();
@@ -605,25 +623,104 @@ async function sendDailyDigest(env: Env): Promise<{ success: boolean; message: s
   const html = buildDigestEmail(totalCount, criticalCount, bySrc.results || [], topEp.results || [], byDomain.results || [], hours);
 
   const subject = criticalCount > 50
-    ? `CRITICAL: ${criticalCount} server errors in last ${hours}h — VNOC`
+    ? `CRITICAL: ${criticalCount} server errors this week — VNOC`
     : criticalCount > 0
-    ? `${totalCount} API errors in last ${hours}h — VNOC`
-    : `${totalCount} API events in last ${hours}h — VNOC`;
+    ? `Weekly: ${totalCount} API errors (${criticalCount} critical) — VNOC`
+    : `Weekly: ${totalCount} API events — all healthy — VNOC`;
 
   const recipients = env.ALERT_RECIPIENTS.split(",").map(e => e.trim()).filter(Boolean);
 
   if (!env.RESEND_API_KEY) {
-    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
+    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, ?, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount, hours).run();
     return { success: false, message: "RESEND_API_KEY not configured." };
   }
 
   try {
     await sendResendEmail(env, recipients, subject, html);
-    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'sent')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
-    return { success: true, message: `Digest sent to ${recipients.length} recipients (${totalCount} errors, ${criticalCount} critical)` };
+    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, ?, 'sent')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount, hours).run();
+    return { success: true, message: `Weekly digest sent to ${recipients.length} recipients (${totalCount} errors, ${criticalCount} critical)` };
   } catch (err: any) {
-    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, 24, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount).run();
+    await env.DB.prepare("INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, ?, ?, ?, 'failed')").bind(env.ALERT_RECIPIENTS, totalCount, criticalCount, hours).run();
     return { success: false, message: `Resend failed: ${err.message}` };
+  }
+}
+
+/**
+ * Real-time critical alert — fires immediately when:
+ * 1. AI analysis flags an error as "critical" severity
+ * 2. Error spike detected on ingest (10+ server errors in 1 hour)
+ *
+ * Rate-limited: max 1 critical alert per hour to avoid spam.
+ */
+async function maybeSendCriticalAlert(
+  env: Env,
+  reason: string,
+  details: { api_source?: string; endpoint?: string; message?: string; diagnosis?: string; suggested_fix?: string }
+): Promise<void> {
+  if (!env.RESEND_API_KEY) return;
+
+  // Rate limit: check if we sent a critical alert in the last hour
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) as cnt FROM alert_history WHERE status = 'critical_sent' AND created_at >= ?"
+  ).bind(oneHourAgo).first<{ cnt: number }>();
+  if ((recent?.cnt || 0) > 0) return; // Already alerted recently
+
+  const recipients = env.ALERT_RECIPIENTS.split(",").map(e => e.trim()).filter(Boolean);
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8fafc;padding:20px;color:#1e293b">
+<div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);border-top:4px solid #dc2626">
+<div style="background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px">
+  <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:28px;margin-bottom:8px">
+  <div style="color:#fca5a5;font-size:20px;font-weight:700">🔴 Critical Alert</div>
+  <div style="color:#94a3b8;font-size:13px;margin-top:4px">${new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" })}</div>
+</div>
+<div style="padding:24px">
+  <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px;margin-bottom:16px">
+    <div style="color:#dc2626;font-weight:700;font-size:14px;margin-bottom:4px">${esc(reason)}</div>
+    ${details.api_source ? `<div style="color:#64748b;font-size:12px">Source: <strong style="color:#1e293b">${esc(details.api_source)}</strong></div>` : ""}
+    ${details.endpoint ? `<div style="color:#64748b;font-size:12px">Endpoint: <strong style="color:#1e293b">${esc(details.endpoint)}</strong></div>` : ""}
+    ${details.message ? `<div style="color:#64748b;font-size:12px;margin-top:4px">Error: <code style="background:#fee2e2;padding:1px 4px;border-radius:3px;font-size:11px">${esc(details.message.substring(0, 300))}</code></div>` : ""}
+  </div>
+  ${details.diagnosis ? `<div style="margin-bottom:12px"><div style="color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">AI Diagnosis</div><p style="font-size:13px;line-height:1.6;color:#334155">${esc(details.diagnosis.substring(0, 500))}</p></div>` : ""}
+  ${details.suggested_fix ? `<div style="margin-bottom:16px"><div style="color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Suggested Fix</div><p style="font-size:13px;line-height:1.6;color:#334155">${esc(details.suggested_fix.substring(0, 500))}</p></div>` : ""}
+  <div style="text-align:center;margin-top:20px">
+    <a href="https://log.vnoc.com/agent" style="display:inline-block;background:#7c3aed;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">Open Error Agent →</a>
+    <a href="https://log.vnoc.com" style="display:inline-block;color:#3b82f6;padding:10px 16px;text-decoration:none;font-size:13px">View Dashboard</a>
+  </div>
+</div>
+<div style="background:#fef2f2;padding:10px 24px;text-align:center;color:#94a3b8;font-size:11px">
+  VNOC Error Hub — Critical alerts are rate-limited to 1 per hour.
+</div>
+</div></body></html>`;
+
+  try {
+    await sendResendEmail(env, recipients, `🔴 CRITICAL: ${reason} — VNOC Error Hub`, html);
+    await env.DB.prepare(
+      "INSERT INTO alert_history (recipients, total_errors, critical_count, period_hours, status) VALUES (?, 1, 1, 0, 'critical_sent')"
+    ).bind(env.ALERT_RECIPIENTS).run();
+  } catch {} // Don't let alert failures break anything
+}
+
+/** Check for error spikes after ingest — fire critical alert if threshold crossed */
+async function checkErrorSpike(env: Env): Promise<void> {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const count = await env.DB.prepare(
+    "SELECT COUNT(*) as cnt FROM error_logs WHERE created_at >= ? AND (error_type = 'error' OR error_type = 'internal_error')"
+  ).bind(oneHourAgo).first<{ cnt: number }>();
+
+  if ((count?.cnt || 0) >= 10) {
+    // Get the most common recent error for context
+    const top = await env.DB.prepare(
+      "SELECT api_source, endpoint, message, COUNT(*) as cnt FROM error_logs WHERE created_at >= ? AND (error_type = 'error' OR error_type = 'internal_error') GROUP BY api_source, endpoint ORDER BY cnt DESC LIMIT 1"
+    ).bind(oneHourAgo).first<{ api_source: string; endpoint: string; message: string; cnt: number }>();
+
+    await maybeSendCriticalAlert(env, `${count!.cnt} server errors in the last hour`, {
+      api_source: top?.api_source,
+      endpoint: top?.endpoint,
+      message: top?.message ? `${top.message} (and ${count!.cnt - 1} more)` : `${count!.cnt} errors`,
+    });
   }
 }
 
@@ -679,7 +776,7 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 <div style="background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;color:#f8fafc">
   <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:30px;margin-bottom:8px">
   <div style="font-size:20px;font-weight:700">VNOC Error Hub</div>
-  <div style="color:#94a3b8;font-size:13px;margin-top:4px">Daily Digest — ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</div>
+  <div style="color:#94a3b8;font-size:13px;margin-top:4px">Weekly Digest — ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</div>
 </div>
 
 <div style="padding:20px 24px">
@@ -723,7 +820,7 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 </div>
 
 <div style="background:#f1f5f9;padding:12px 24px;color:#94a3b8;font-size:11px;text-align:center">
-  VNOC Error Hub — log.vnoc.com — This is an automated daily digest.
+  VNOC Error Hub — log.vnoc.com — Weekly digest, sent every Tuesday.
 </div>
 </div></body></html>`;
 }
