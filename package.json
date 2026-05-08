@@ -1,0 +1,17 @@
+{
+  "name": "api-error-hub",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create api-error-hub-db",
+    "db:migrate": "wrangler d1 execute api-error-hub-db --file=src/schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute api-error-hub-db --file=src/schema.sql --local"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.0"
+  }
+}
