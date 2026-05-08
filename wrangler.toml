@@ -1,7 +1,7 @@
 name = "api-error-hub"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
-account_id = "04366e6a18a185bcae6be03a3bd99aca"
+account_id = "8cff55b678de16d75a95167d112e7831"
 
 # Custom domain: log.vnoc.com
 # After deploy, go to CF dashboard → Workers → api-error-hub → Triggers → Custom Domains → Add "log.vnoc.com"
@@ -30,7 +30,7 @@ ALERT_RECIPIENTS = "maida@vnoc.com,kjabellar@gmail.com,rownone@gmail.com"
 [[d1_databases]]
 binding = "DB"
 database_name = "api-error-hub-db"
-database_id = "e64f6a85-68db-43f4-b539-2346dc00e24f"
+database_id = "ea90fd11-af41-41f8-92c3-a29e95fc59f7"
 
 # Daily cron: send error digest email at 8 AM UTC (4 AM ET)
 [triggers]
