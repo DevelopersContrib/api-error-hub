@@ -14,7 +14,9 @@
  *   GET  /                — Dashboard HTML
  *   GET  /health          — Health check
  *   POST /send-digest     — Trigger email digest manually (dashboard key)
- *   POST /analyze         — AI-powered error analysis (CF Workers AI)
+ *   POST /analyze         — AI-powered single error analysis (CF Workers AI)
+ *   GET  /agent           — Error Log Agent chat page
+ *   POST /agent/chat      — Agent chat API (context-aware, multi-turn)
  *   GET  /install         — One-click setup page for new projects
  *
  * Cron: daily at 8 AM UTC → sends digest email via Resend
@@ -53,6 +55,8 @@ export default {
       if (path === "/clear" && request.method === "POST") return handleClear(request, env);
       if (path === "/send-digest" && request.method === "POST") return handleManualDigest(env, request);
       if (path === "/analyze" && request.method === "POST") return handleAnalyze(request, env);
+      if (path === "/agent/chat" && request.method === "POST") return handleAgentChat(request, env);
+      if (path === "/agent") return handleAgentPage();
       if (path === "/install") return handleInstall();
       if (path === "/health") return json({ status: "ok", ts: new Date().toISOString() });
       if (path === "/" || path === "/dashboard") return handleDashboard(env, request);
@@ -231,6 +235,122 @@ Respond in this exact JSON format (no markdown, no code fences):
   }
 }
 
+// ── POST /agent/chat — Context-Aware Error Agent ───────────────────────────
+
+async function buildAgentContext(env: Env, source?: string, hours = 24): Promise<string> {
+  const since = new Date(Date.now() - hours * 3600000).toISOString();
+  let w = "created_at >= ?"; const p: any[] = [since];
+  if (source) { w += " AND api_source = ?"; p.push(source); }
+
+  const total = await env.DB.prepare(`SELECT COUNT(*) as total FROM error_logs WHERE ${w}`).bind(...p).first<{total:number}>();
+  const bySrc = await env.DB.prepare(`SELECT api_source, error_type, COUNT(*) as count FROM error_logs WHERE ${w} GROUP BY api_source, error_type ORDER BY count DESC LIMIT 30`).bind(...p).all();
+  const topEp = await env.DB.prepare(`SELECT api_source, endpoint, method, error_type, COUNT(*) as count, MAX(message) as sample_message, MAX(created_at) as last_seen FROM error_logs WHERE ${w} GROUP BY api_source, endpoint, method, error_type ORDER BY count DESC LIMIT 25`).bind(...p).all();
+  const recentErrors = await env.DB.prepare(`SELECT api_source, error_type, endpoint, method, message, domain, ip, created_at FROM error_logs WHERE ${w} ORDER BY created_at DESC LIMIT 20`).bind(...p).all();
+  const byDomain = await env.DB.prepare(`SELECT domain, COUNT(*) as count FROM error_logs WHERE ${w} AND domain != '' GROUP BY domain ORDER BY count DESC LIMIT 15`).bind(...p).all();
+  const sources = await env.DB.prepare(`SELECT api_source, COUNT(*) as total, MAX(created_at) as last_error FROM error_logs GROUP BY api_source ORDER BY total DESC`).all();
+
+  const srcSummary = (bySrc.results || []).map((r: any) => `  ${r.api_source} → ${r.error_type}: ${r.count}`).join("\n");
+  const epSummary = (topEp.results || []).map((r: any) => `  [${r.count}x] ${r.method} ${r.api_source}${r.endpoint} (${r.error_type}) — "${(r.sample_message || "").substring(0, 120)}"`).join("\n");
+  const recentList = (recentErrors.results || []).map((r: any) => `  ${(r.created_at||"").substring(0,19)} | ${r.api_source} | ${r.error_type} | ${r.method} ${r.endpoint} | ${(r.message||"").substring(0,150)}${r.domain ? " | domain:"+r.domain : ""}`).join("\n");
+  const domainList = (byDomain.results || []).map((r: any) => `  ${r.domain}: ${r.count} errors`).join("\n");
+  const srcList = (sources.results || []).map((r: any) => `  ${r.api_source} (${r.total} total, last: ${(r.last_error||"").substring(0,19)})`).join("\n");
+
+  return `=== LIVE ERROR DATA (last ${hours}h${source ? ", filtered to: " + source : ""}) ===
+Total errors: ${total?.total || 0}
+
+REGISTERED API SOURCES (all time):
+${srcList || "  None"}
+
+ERRORS BY SOURCE + TYPE:
+${srcSummary || "  None"}
+
+TOP ERROR ENDPOINTS (grouped by frequency):
+${epSummary || "  None"}
+
+MOST RECENT 20 ERRORS:
+${recentList || "  None"}
+
+TOP DOMAINS TRIGGERING ERRORS:
+${domainList || "  None"}
+=== END LIVE DATA ===`;
+}
+
+async function handleAgentChat(request: Request, env: Env): Promise<Response> {
+  let body: { messages: { role: string; content: string }[]; source?: string; hours?: number; focus_error?: any };
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+
+  if (!body.messages?.length) return json({ error: "messages array required" }, 400);
+
+  // Build live context from D1
+  const context = await buildAgentContext(env, body.source, body.hours || 24);
+
+  // If there's a specific error to focus on, add it
+  let focusCtx = "";
+  if (body.focus_error) {
+    const fe = body.focus_error;
+    focusCtx = `\n\n=== FOCUSED ERROR ===
+The user clicked "Analyze" on this specific error:
+- Source: ${fe.api_source || "?"}
+- Type: ${fe.error_type || "?"}
+- Method: ${fe.method || "?"}
+- Endpoint: ${fe.endpoint || "?"}
+- Message: ${fe.message || "?"}
+- User Agent: ${fe.user_agent || "?"}
+- Query Params: ${fe.query_params || "?"}
+Please analyze this error specifically.
+=== END FOCUSED ERROR ===`;
+  }
+
+  const systemPrompt = `You are the VNOC Error Log Agent — an expert AI assistant for diagnosing and resolving API errors across the VNOC platform.
+
+You have LIVE access to the error database. Below is real-time data from the error hub:
+
+${context}${focusCtx}
+
+YOUR CAPABILITIES:
+- Diagnose individual errors and explain root causes in plain language
+- Spot patterns: recurring errors, spikes, correlated failures across services
+- Recommend specific code fixes with file paths and code snippets when possible
+- Assess severity and prioritize which errors to fix first
+- Identify bot/scanner traffic vs real user errors
+- Track error trends over time
+
+VNOC PLATFORM CONTEXT:
+- api-contrib1 (api1.contrib.co): Next.js API — domains, members, challenge, icontent controllers
+- api-contrib2 (api2.contrib.co): Next.js API — request, jobs, challenges, vertical, forum controllers
+- api-contentagent (api.contentagent.com): Next.js API — content management
+- api-socialagent (api.socialagent.com): Next.js API — social features
+- api-dntrademark (api.dntrademark.com): Next.js API — trademark search + domain tools
+- All use MySQL backends, fire-and-forget error reporting to this hub
+
+RESPONSE STYLE:
+- Be direct and actionable. No fluff.
+- Use bullet points for clarity
+- When you see patterns, call them out proactively
+- If an error is from a bot/scanner (e.g. /.env, /wp-admin, /.git), say so
+- Rate severity: 🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Low
+- If you don't have enough data, say so honestly
+
+When the conversation starts, give a brief status overview if the user hasn't asked a specific question.`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...body.messages.slice(-10), // Keep last 10 messages for context window
+  ];
+
+  try {
+    const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      messages,
+      max_tokens: 1024,
+      temperature: 0.4,
+    });
+
+    return json({ success: true, response: result.response || "No response from AI." });
+  } catch (err: any) {
+    return json({ success: false, error: `Agent error: ${err.message || "Unknown"}` }, 500);
+  }
+}
+
 // ── POST /send-digest (manual trigger) ──────────────────────────────────────
 
 async function handleManualDigest(env: Env, req: Request): Promise<Response> {
@@ -385,6 +505,298 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 }
 
 function esc(s: any): string { return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+// ── GET /agent — Error Log Agent Chat Page ─────────────────────────────────
+
+function handleAgentPage(): Response {
+  return new Response(agentHTML(), {
+    headers: { "Content-Type": "text/html; charset=utf-8", ...CORS },
+  });
+}
+
+function agentHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Error Log Agent — VNOC</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;height:100vh;display:flex;flex-direction:column}
+.hdr{background:linear-gradient(135deg,#1e293b,#334155);padding:12px 20px;border-bottom:1px solid #475569;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.hdr img{height:24px}
+.hdr h1{font-size:16px;font-weight:600;color:#f8fafc}
+.hdr .agent-badge{background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font-size:11px;padding:3px 10px;border-radius:12px;font-weight:600;display:flex;align-items:center;gap:4px}
+.hdr .agent-badge .dot{width:6px;height:6px;background:#22c55e;border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hdr .rt{margin-left:auto;display:flex;gap:8px;align-items:center}
+.hdr a{color:#94a3b8;text-decoration:none;font-size:12px;padding:4px 10px;border-radius:6px;border:1px solid #334155}
+.hdr a:hover{background:#334155;color:#f8fafc}
+.hdr select{background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:4px 8px;border-radius:6px;font-size:12px}
+
+.chat-wrap{flex:1;display:flex;flex-direction:column;max-width:900px;width:100%;margin:0 auto;overflow:hidden}
+.messages{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:85%;padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.65;word-wrap:break-word}
+.msg-agent{background:#1e293b;border:1px solid #334155;align-self:flex-start;border-bottom-left-radius:4px}
+.msg-user{background:#3b82f6;color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+.msg-agent .sender{font-size:11px;color:#7c3aed;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:4px}
+.msg-user .sender{font-size:11px;color:rgba(255,255,255,.7);font-weight:600;margin-bottom:4px;text-align:right}
+.msg-agent .body{color:#e2e8f0}
+.msg-agent .body p{margin-bottom:8px}
+.msg-agent .body ul,.msg-agent .body ol{margin:6px 0 8px 18px}
+.msg-agent .body li{margin-bottom:3px}
+.msg-agent .body code{background:#0f172a;padding:1px 5px;border-radius:3px;font-size:12px;color:#a5b4fc}
+.msg-agent .body pre{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;overflow-x:auto;margin:8px 0}
+.msg-agent .body pre code{background:none;padding:0}
+.msg-agent .body strong{color:#f8fafc}
+.msg-agent .body h1,.msg-agent .body h2,.msg-agent .body h3{color:#f8fafc;margin:10px 0 4px;font-size:14px}
+
+.typing{align-self:flex-start;padding:12px 16px;background:#1e293b;border:1px solid #334155;border-radius:12px;border-bottom-left-radius:4px;display:none}
+.typing.show{display:block}
+.typing-dots{display:flex;gap:4px;align-items:center}
+.typing-dots span{width:7px;height:7px;background:#7c3aed;border-radius:50%;animation:blink 1.4s infinite}
+.typing-dots span:nth-child(2){animation-delay:.2s}
+.typing-dots span:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,100%{opacity:.3}50%{opacity:1}}
+
+.quick-actions{padding:8px 20px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0}
+.qa-btn{background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;transition:all .15s}
+.qa-btn:hover{background:#334155;color:#f8fafc;border-color:#475569}
+
+.input-wrap{padding:12px 20px 16px;flex-shrink:0;display:flex;gap:8px;align-items:end}
+.input-box{flex:1;display:flex;background:#1e293b;border:1px solid #475569;border-radius:12px;overflow:hidden;transition:border-color .2s}
+.input-box:focus-within{border-color:#7c3aed}
+.input-box textarea{flex:1;background:none;border:none;color:#e2e8f0;padding:12px 16px;font-size:14px;font-family:inherit;resize:none;outline:none;max-height:120px;min-height:44px;line-height:1.4}
+.send-btn{background:#7c3aed;color:#fff;border:none;width:42px;height:42px;border-radius:10px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:background .15s;flex-shrink:0}
+.send-btn:hover{background:#6d28d9}
+.send-btn:disabled{background:#334155;cursor:not-allowed}
+
+.status-bar{padding:6px 20px;background:#0f172a;border-top:1px solid #1e293b;display:flex;align-items:center;gap:8px;flex-shrink:0;font-size:11px;color:#64748b}
+.status-bar .dot{width:5px;height:5px;border-radius:50%}
+.dot-green{background:#22c55e}.dot-yellow{background:#eab308}.dot-red{background:#ef4444}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:24px">
+  <h1>Error Log Agent</h1>
+  <span class="agent-badge"><span class="dot"></span> Online</span>
+  <div class="rt">
+    <select id="srcFilter" onchange="resetChat()"><option value="">All Sources</option></select>
+    <a href="/">Dashboard</a>
+    <a href="/install">Install</a>
+  </div>
+</div>
+
+<div class="chat-wrap">
+  <div class="messages" id="messages"></div>
+  <div class="typing" id="typing"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+
+  <div class="quick-actions" id="quickActions">
+    <button class="qa-btn" onclick="ask('What\\'s the current status? Give me a quick health check of all APIs.')">🔍 Status Check</button>
+    <button class="qa-btn" onclick="ask('What are the most critical errors right now? Prioritize what I should fix first.')">🔴 Critical Issues</button>
+    <button class="qa-btn" onclick="ask('Are there any error patterns or spikes? What trends do you see?')">📊 Spot Patterns</button>
+    <button class="qa-btn" onclick="ask('Which errors are from bots/scanners vs real users? Help me filter the noise.')">🤖 Bot vs Real</button>
+    <button class="qa-btn" onclick="ask('Give me a daily briefing — summary of the last 24 hours of errors across all services.')">📋 Daily Briefing</button>
+    <button class="qa-btn" onclick="ask('Which API source has the most problems? Break it down.')">🏷️ Worst Source</button>
+  </div>
+
+  <div class="input-wrap">
+    <div class="input-box">
+      <textarea id="input" placeholder="Ask about your errors... (e.g. 'Why is api-contrib1 throwing 404s?')" rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+    </div>
+    <button class="send-btn" id="sendBtn" onclick="send()">↑</button>
+  </div>
+
+  <div class="status-bar">
+    <span class="dot dot-green" id="statusDot"></span>
+    <span id="statusText">Loading error data...</span>
+  </div>
+</div>
+
+<script>
+const B=location.origin;
+let chatHistory=[];
+let sending=false;
+
+async function F(p,o={}){return(await fetch(B+p,o)).json()}
+
+// Load sources dropdown
+async function loadSources(){
+  try{
+    const d=await F('/sources');
+    const sel=document.getElementById('srcFilter');
+    (d.sources||[]).forEach(r=>{
+      const o=document.createElement('option');
+      o.value=r.api_source;
+      o.textContent=r.api_source+' ('+r.total+')';
+      sel.appendChild(o);
+    });
+    const total=(d.sources||[]).reduce((a,r)=>a+r.total,0);
+    const srcCount=(d.sources||[]).length;
+    setStatus('green','Connected — '+srcCount+' sources, '+total+' total errors in database');
+  }catch(e){
+    setStatus('red','Failed to connect to error hub');
+  }
+}
+
+function setStatus(color,text){
+  document.getElementById('statusDot').className='dot dot-'+color;
+  document.getElementById('statusText').textContent=text;
+}
+
+function addMessage(role,content){
+  const div=document.createElement('div');
+  div.className='msg msg-'+role;
+  if(role==='agent'){
+    div.innerHTML='<div class="sender">🤖 Error Log Agent</div><div class="body">'+formatMd(content)+'</div>';
+  }else{
+    div.innerHTML='<div class="sender">You</div>'+esc(content);
+  }
+  document.getElementById('messages').appendChild(div);
+  scrollBottom();
+}
+
+function scrollBottom(){
+  const m=document.getElementById('messages');
+  m.scrollTop=m.scrollHeight;
+}
+
+function formatMd(text){
+  // Basic markdown-like formatting
+  let html=esc(text);
+  // Bold
+  html=html.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+  // Inline code
+  html=html.replace(/\`([^\`]+)\`/g,'<code>$1</code>');
+  // Code blocks
+  html=html.replace(/\`\`\`([\\s\\S]*?)\`\`\`/g,'<pre><code>$1</code></pre>');
+  // Headers
+  html=html.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+  html=html.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+  html=html.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+  // Bullet points
+  html=html.replace(/^[\\-\\*] (.+)$/gm,'<li>$1</li>');
+  html=html.replace(/(<li>.*<\\/li>)/gs,function(m){return '<ul>'+m+'</ul>';});
+  // Fix nested ul
+  html=html.replace(/<\\/ul>\\s*<ul>/g,'');
+  // Numbered lists
+  html=html.replace(/^\\d+\\. (.+)$/gm,'<li>$1</li>');
+  // Paragraphs
+  html=html.replace(/\\n\\n/g,'</p><p>');
+  html=html.replace(/\\n/g,'<br>');
+  return '<p>'+html+'</p>';
+}
+
+function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+
+async function send(){
+  if(sending)return;
+  const input=document.getElementById('input');
+  const text=input.value.trim();
+  if(!text)return;
+
+  input.value='';
+  input.style.height='auto';
+  addMessage('user',text);
+  chatHistory.push({role:'user',content:text});
+
+  sending=true;
+  document.getElementById('sendBtn').disabled=true;
+  document.getElementById('typing').classList.add('show');
+  setStatus('yellow','Agent is thinking...');
+  scrollBottom();
+
+  try{
+    const source=document.getElementById('srcFilter').value;
+    const r=await F('/agent/chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        messages:chatHistory,
+        source:source||undefined,
+        hours:24
+      })
+    });
+
+    document.getElementById('typing').classList.remove('show');
+
+    if(r.success){
+      const reply=r.response;
+      chatHistory.push({role:'assistant',content:reply});
+      addMessage('agent',reply);
+      setStatus('green','Ready');
+    }else{
+      addMessage('agent','Sorry, I encountered an error: '+(r.error||'Unknown error')+'. Please try again.');
+      setStatus('red','Error — try again');
+    }
+  }catch(e){
+    document.getElementById('typing').classList.remove('show');
+    addMessage('agent','Failed to reach the agent backend. Is log.vnoc.com running?');
+    setStatus('red','Connection failed');
+  }
+
+  sending=false;
+  document.getElementById('sendBtn').disabled=false;
+  input.focus();
+}
+
+function ask(text){
+  document.getElementById('input').value=text;
+  send();
+}
+
+function resetChat(){
+  chatHistory=[];
+  document.getElementById('messages').innerHTML='';
+  addWelcome();
+}
+
+// Check for URL params (e.g. from dashboard "Analyze" button)
+function checkParams(){
+  const p=new URLSearchParams(location.search);
+  if(p.get('msg')){
+    // Pre-populate from dashboard analyze click
+    const q='Analyze this specific error:\\n- Source: '+
+      (p.get('src')||'?')+'\\n- Type: '+(p.get('type')||'?')+
+      '\\n- Endpoint: '+(p.get('method')||'?')+' '+(p.get('ep')||'?')+
+      '\\n- Message: '+(p.get('msg')||'?');
+    setTimeout(()=>ask(q),500);
+    return true;
+  }
+  return false;
+}
+
+function addWelcome(){
+  addMessage('agent',\`Hey! I'm your **Error Log Agent**. I have live access to all your API error data across every connected service.
+
+Here's what I can do:
+- **Diagnose errors** — explain what went wrong and how to fix it
+- **Spot patterns** — find recurring issues, spikes, and correlated failures
+- **Prioritize** — tell you what to fix first based on severity and frequency
+- **Filter noise** — separate bot/scanner traffic from real user errors
+
+Use the quick action buttons below, or just ask me anything about your errors.\`);
+}
+
+// Auto-resize textarea
+document.getElementById('input').addEventListener('input',function(){
+  this.style.height='auto';
+  this.style.height=Math.min(this.scrollHeight,120)+'px';
+});
+
+// Init
+loadSources().then(()=>{
+  addWelcome();
+  if(!checkParams()){
+    // Auto-status on load
+    setTimeout(()=>ask('Give me a quick status check — how are things looking across all APIs right now?'),800);
+  }
+});
+</script>
+</body></html>`;
+}
 
 // ── GET /install — Setup Page ───────────────────────────────────────────────
 
@@ -726,24 +1138,8 @@ tr:hover td{background:#334155}
 #toast{position:fixed;bottom:20px;right:20px;background:#22c55e;color:#fff;padding:10px 20px;border-radius:8px;display:none;font-weight:500;z-index:100;font-size:13px}
 .tab-row{display:flex;gap:2px;margin-bottom:12px}.tab-btn{padding:6px 14px;border-radius:6px 6px 0 0;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-bottom:none;cursor:pointer;font-size:12px;font-weight:500}
 .tab-btn.active{background:#334155;color:#f8fafc}
-.ai-btn{background:#7c3aed;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px;font-weight:600;white-space:nowrap}
-.ai-btn:hover{background:#6d28d9}.ai-btn:disabled{opacity:.5;cursor:wait}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:200;align-items:center;justify-content:center}
-.modal-bg.show{display:flex}
-.modal{background:#1e293b;border:1px solid #475569;border-radius:12px;max-width:600px;width:90%;max-height:80vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
-.modal-hdr{padding:16px 20px;border-bottom:1px solid #334155;display:flex;align-items:center;gap:10px}
-.modal-hdr h3{font-size:16px;color:#f8fafc;flex:1}.modal-close{background:none;border:none;color:#94a3b8;font-size:20px;cursor:pointer}
-.modal-body{padding:20px}
-.ai-section{margin-bottom:16px}
-.ai-section h4{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
-.ai-section p{font-size:14px;line-height:1.6;color:#e2e8f0}
-.sev-badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase}
-.sev-critical{background:#dc2626;color:#fff}.sev-high{background:#ea580c;color:#fff}.sev-medium{background:#d97706;color:#fff}.sev-low{background:#059669;color:#fff}
-.ai-loading{text-align:center;padding:40px;color:#94a3b8}
-.ai-loading .spinner{display:inline-block;width:24px;height:24px;border:3px solid #334155;border-top:3px solid #7c3aed;border-radius:50%;animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.ai-error-ctx{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px;margin-bottom:16px;font-size:12px;color:#94a3b8}
-.ai-error-ctx span{color:#e2e8f0}
+.ai-btn{display:inline-block;background:#7c3aed;color:#fff;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;white-space:nowrap;text-align:center}
+.ai-btn:hover{background:#6d28d9}
 </style>
 </head>
 <body>
@@ -752,6 +1148,7 @@ tr:hover td{background:#334155}
   <h1>log.vnoc.com</h1>
   <span class="badge" id="totalBadge">—</span>
   <div class="rt">
+    <a href="/agent" class="btn" style="background:#7c3aed;text-decoration:none" title="Chat with the Error Log Agent">🤖 Agent</a>
     <a href="/install" class="btn btn-ghost" title="Add a new project" style="text-decoration:none">🔌 Install</a>
     <button class="btn btn-green" onclick="sendDigest()" title="Send email digest now">📧 Send Digest</button>
     <span class="sub">VNOC Error Hub</span>
@@ -781,11 +1178,6 @@ tr:hover td{background:#334155}
     <div class="pg"><button id="prevB" onclick="pg(-1)" disabled>&laquo;</button><span id="pgInfo" style="color:#64748b;padding:4px 8px;font-size:12px"></span><button id="nextB" onclick="pg(1)" disabled>&raquo;</button></div>
   </div>
 </div>
-<div class="modal-bg" id="aiModal" onclick="if(event.target===this)closeAI()">
-<div class="modal">
-<div class="modal-hdr"><span style="font-size:20px">🤖</span><h3>AI Error Analysis</h3><button class="modal-close" onclick="closeAI()">&times;</button></div>
-<div class="modal-body" id="aiBody"><div class="ai-loading"><div class="spinner"></div><p style="margin-top:10px">Analyzing error with AI...</p></div></div>
-</div></div>
 <div id="toast"></div>
 <script>
 const B=location.origin;let off=0,tot=0,tab='logs';const L=50;
@@ -806,7 +1198,7 @@ async function load(){if(tab==='summary')return loadSum();const src=document.get
 let q='?limit='+L+'&offset='+off;if(src)q+='&source='+encodeURIComponent(src);if(ty)q+='&type='+encodeURIComponent(ty);if(ep)q+='&endpoint='+encodeURIComponent(ep);if(dom)q+='&domain='+encodeURIComponent(dom);if(s)q+='&search='+encodeURIComponent(s);
 const d=await F('/logs'+q);if(!d.success)return;tot=d.total;
 document.getElementById('th').innerHTML='<tr><th>Time</th><th>Source</th><th>Type</th><th>Method</th><th>Endpoint</th><th>Message</th><th>Domain</th><th>IP</th><th style="width:60px">AI</th></tr>';
-document.getElementById('tb').innerHTML=(d.logs||[]).map(l=>'<tr><td style="white-space:nowrap;color:#64748b">'+(l.created_at||'').replace('T',' ').substring(0,19)+'</td><td><span class="st">'+esc(l.api_source)+'</span></td><td><span class="bt '+bc(l.error_type)+'">'+esc(l.error_type)+'</span></td><td>'+esc(l.method)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.endpoint)+'">'+esc(l.endpoint)+'</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8" title="'+esc(l.message)+'">'+esc(l.message)+'</td><td style="color:#a855f7;font-size:11px">'+esc(l.domain)+'</td><td style="color:#64748b;font-size:11px">'+esc(l.ip)+'</td><td><button class="ai-btn" onclick="analyzeErr(this)" data-src="'+esc(l.api_source)+'" data-type="'+esc(l.error_type)+'" data-ep="'+esc(l.endpoint)+'" data-method="'+esc(l.method)+'" data-msg="'+esc(l.message)+'" data-ua="'+esc(l.user_agent)+'" data-qp="'+esc(l.query_params)+'">🤖</button></td></tr>').join('')||'<tr><td colspan="9" class="empty">No errors found</td></tr>';
+document.getElementById('tb').innerHTML=(d.logs||[]).map(l=>'<tr><td style="white-space:nowrap;color:#64748b">'+(l.created_at||'').replace('T',' ').substring(0,19)+'</td><td><span class="st">'+esc(l.api_source)+'</span></td><td><span class="bt '+bc(l.error_type)+'">'+esc(l.error_type)+'</span></td><td>'+esc(l.method)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.endpoint)+'">'+esc(l.endpoint)+'</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8" title="'+esc(l.message)+'">'+esc(l.message)+'</td><td style="color:#a855f7;font-size:11px">'+esc(l.domain)+'</td><td style="color:#64748b;font-size:11px">'+esc(l.ip)+'</td><td><a class="ai-btn" href="/agent?src='+encodeURIComponent(l.api_source||'')+'&type='+encodeURIComponent(l.error_type||'')+'&ep='+encodeURIComponent(l.endpoint||'')+'&method='+encodeURIComponent(l.method||'')+'&msg='+encodeURIComponent((l.message||'').substring(0,200))+'" target="_blank" style="text-decoration:none">🤖</a></td></tr>').join('')||'<tr><td colspan="9" class="empty">No errors found</td></tr>';
 upPg();stats()}
 async function loadSum(){const src=document.getElementById('fSrc').value;const d=await F('/summary?hours=24'+(src?'&source='+src:''));if(!d.success)return;
 document.getElementById('th').innerHTML='<tr><th>Source</th><th>Endpoint</th><th>Type</th><th>Hits</th><th>Last Seen</th></tr>';
@@ -818,29 +1210,6 @@ function pg(d){off=Math.max(0,off+d*L);load()}
 async function clearL(){const src=document.getElementById('fSrc').value;if(!src){toast('Select a source','#d97706');return}if(!confirm('Clear all logs for '+src+'?'))return;const d=await F('/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:src})});if(d.success){toast('Cleared '+d.deleted);off=0;load()}else toast(d.error||'Failed','#ef4444')}
 async function sendDigest(){if(!confirm('Send error digest email now?'))return;const d=await F('/send-digest',{method:'POST'});toast(d.message||'Done',d.success?'#22c55e':'#ef4444')}
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-async function analyzeErr(btn){
-const data={api_source:btn.dataset.src,error_type:btn.dataset.type,endpoint:btn.dataset.ep,method:btn.dataset.method,message:btn.dataset.msg,user_agent:btn.dataset.ua,query_params:btn.dataset.qp};
-document.getElementById('aiModal').classList.add('show');
-document.getElementById('aiBody').innerHTML='<div class="ai-loading"><div class="spinner"></div><p style="margin-top:10px">Analyzing error with AI...</p></div>';
-btn.disabled=true;btn.textContent='...';
-try{
-const r=await F('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-if(r.success&&r.analysis){
-const a=r.analysis;const sevClass='sev-'+(a.severity||'medium');
-document.getElementById('aiBody').innerHTML=
-'<div class="ai-error-ctx"><b>Error:</b> <span>'+esc(data.message)+'</span><br><b>Source:</b> <span>'+esc(data.api_source)+'</span> &middot; <b>Endpoint:</b> <span>'+esc(data.method)+' '+esc(data.endpoint)+'</span> &middot; <b>Type:</b> <span>'+esc(data.error_type)+'</span></div>'+
-'<div class="ai-section"><h4>Severity</h4><span class="sev-badge '+sevClass+'">'+esc(a.severity||'medium')+'</span>'+(a.category?' <span style="color:#94a3b8;font-size:12px;margin-left:8px">'+esc(a.category)+'</span>':'')+'</div>'+
-'<div class="ai-section"><h4>Diagnosis</h4><p>'+esc(a.diagnosis)+'</p></div>'+
-'<div class="ai-section"><h4>Suggested Fix</h4><p>'+esc(a.suggested_fix)+'</p></div>';
-}else{
-document.getElementById('aiBody').innerHTML='<div class="ai-loading" style="color:#ef4444"><p>'+esc(r.error||'Analysis failed')+'</p></div>';
-}
-}catch(e){
-document.getElementById('aiBody').innerHTML='<div class="ai-loading" style="color:#ef4444"><p>Failed to reach AI: '+esc(e.message)+'</p></div>';
-}
-btn.disabled=false;btn.textContent='🤖';
-}
-function closeAI(){document.getElementById('aiModal').classList.remove('show')}
 init();
 </script></body></html>`;
 }
