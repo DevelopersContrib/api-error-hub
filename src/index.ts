@@ -1,5 +1,5 @@
 /**
- * log.vnoc.com — VentureOS Centralized Error Hub
+ * log.vnoc.com — VNOC Centralized Error Hub
  *
  * Cloudflare Worker + D1 + Resend
  *
@@ -14,12 +14,15 @@
  *   GET  /                — Dashboard HTML
  *   GET  /health          — Health check
  *   POST /send-digest     — Trigger email digest manually (dashboard key)
+ *   POST /analyze         — AI-powered error analysis (CF Workers AI)
+ *   GET  /install         — One-click setup page for new projects
  *
  * Cron: daily at 8 AM UTC → sends digest email via Resend
  */
 
 export interface Env {
   DB: D1Database;
+  AI: any;
   VNOC_API_URL: string;
   VNOC_API_KEY: string;
   RESEND_API_KEY: string;
@@ -49,6 +52,8 @@ export default {
       if (path === "/sources") return handleSources(env, request);
       if (path === "/clear" && request.method === "POST") return handleClear(request, env);
       if (path === "/send-digest" && request.method === "POST") return handleManualDigest(env, request);
+      if (path === "/analyze" && request.method === "POST") return handleAnalyze(request, env);
+      if (path === "/install") return handleInstall();
       if (path === "/health") return json({ status: "ok", ts: new Date().toISOString() });
       if (path === "/" || path === "/dashboard") return handleDashboard(env, request);
       return json({ error: "Not found" }, 404);
@@ -167,6 +172,65 @@ async function handleClear(req: Request, env: Env): Promise<Response> {
   return json({ success: true, deleted: result.meta.changes });
 }
 
+// ── POST /analyze — AI Error Analysis ──────────────────────────────────────
+
+async function handleAnalyze(request: Request, env: Env): Promise<Response> {
+  let body: { error_type?: string; endpoint?: string; method?: string; message?: string; api_source?: string; query_params?: string; user_agent?: string };
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+
+  if (!body.message) return json({ error: "message is required" }, 400);
+
+  const prompt = `You are an expert API error analyst for VNOC, a web platform company. Analyze the following API error and provide:
+1. A clear diagnosis of what likely caused the error
+2. Specific steps to fix it
+3. A severity rating (critical, high, medium, low)
+
+Error Details:
+- API Source: ${body.api_source || "unknown"}
+- Error Type: ${body.error_type || "unknown"}
+- HTTP Method: ${body.method || "unknown"}
+- Endpoint: ${body.endpoint || "unknown"}
+- Error Message: ${body.message}
+${body.query_params ? `- Query Params: ${body.query_params}` : ""}
+${body.user_agent ? `- User Agent: ${body.user_agent}` : ""}
+
+Respond in this exact JSON format (no markdown, no code fences):
+{"diagnosis":"...","suggested_fix":"...","severity":"critical|high|medium|low","category":"..."}`;
+
+  try {
+    const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      messages: [
+        { role: "system", content: "You are an API error analyst. Always respond with valid JSON only, no markdown formatting." },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 512,
+      temperature: 0.3,
+    });
+
+    const text = (result.response || "").trim();
+
+    // Try to parse AI response as JSON
+    let analysis: any;
+    try {
+      // Strip markdown code fences if the model added them
+      const cleaned = text.replace(/^```json?\n?/i, "").replace(/\n?```$/i, "").trim();
+      analysis = JSON.parse(cleaned);
+    } catch {
+      // If AI didn't return valid JSON, wrap the raw text
+      analysis = {
+        diagnosis: text,
+        suggested_fix: "Review the error details and check server logs for more context.",
+        severity: "medium",
+        category: "uncategorized",
+      };
+    }
+
+    return json({ success: true, analysis });
+  } catch (err: any) {
+    return json({ success: false, error: `AI analysis failed: ${err.message || "Unknown error"}` }, 500);
+  }
+}
+
 // ── POST /send-digest (manual trigger) ──────────────────────────────────────
 
 async function handleManualDigest(env: Env, req: Request): Promise<Response> {
@@ -197,10 +261,10 @@ async function sendDailyDigest(env: Env): Promise<{ success: boolean; message: s
   const html = buildDigestEmail(totalCount, criticalCount, bySrc.results || [], topEp.results || [], byDomain.results || [], hours);
 
   const subject = criticalCount > 50
-    ? `CRITICAL: ${criticalCount} server errors in last ${hours}h — VentureOS`
+    ? `CRITICAL: ${criticalCount} server errors in last ${hours}h — VNOC`
     : criticalCount > 0
-    ? `${totalCount} API errors in last ${hours}h — VentureOS`
-    : `${totalCount} API events in last ${hours}h — VentureOS`;
+    ? `${totalCount} API errors in last ${hours}h — VNOC`
+    : `${totalCount} API events in last ${hours}h — VNOC`;
 
   const recipients = env.ALERT_RECIPIENTS.split(",").map(e => e.trim()).filter(Boolean);
 
@@ -270,7 +334,7 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 
 <div style="background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;color:#f8fafc">
   <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:30px;margin-bottom:8px">
-  <div style="font-size:20px;font-weight:700">VentureOS Error Hub</div>
+  <div style="font-size:20px;font-weight:700">VNOC Error Hub</div>
   <div style="color:#94a3b8;font-size:13px;margin-top:4px">Daily Digest — ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</div>
 </div>
 
@@ -315,12 +379,294 @@ function buildDigestEmail(total: number, critical: number, bySrc: any[], topEp: 
 </div>
 
 <div style="background:#f1f5f9;padding:12px 24px;color:#94a3b8;font-size:11px;text-align:center">
-  VentureOS Error Hub — log.vnoc.com — This is an automated daily digest.
+  VNOC Error Hub — log.vnoc.com — This is an automated daily digest.
 </div>
 </div></body></html>`;
 }
 
 function esc(s: any): string { return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+// ── GET /install — Setup Page ───────────────────────────────────────────────
+
+function handleInstall(): Response {
+  return new Response(installHTML(), {
+    headers: { "Content-Type": "text/html; charset=utf-8", ...CORS },
+  });
+}
+
+function installHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Install — VNOC Error Hub</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔌</text></svg>">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.hdr{background:linear-gradient(135deg,#1e293b,#334155);padding:16px 24px;border-bottom:1px solid #475569;display:flex;align-items:center;gap:12px}
+.hdr h1{font-size:18px;font-weight:600;color:#f8fafc}.hdr a{color:#3b82f6;text-decoration:none;font-size:13px;margin-left:auto}
+.cnt{max-width:900px;margin:0 auto;padding:24px}
+h2{font-size:22px;font-weight:700;margin-bottom:8px}
+p.sub{color:#94a3b8;font-size:14px;margin-bottom:20px}
+.step{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px}
+.step h3{font-size:15px;color:#f8fafc;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.step h3 .num{background:#3b82f6;color:#fff;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+label{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px;margin-top:12px}
+input,select{width:100%;background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:14px;font-family:inherit}
+input:focus,select:focus{outline:none;border-color:#3b82f6}
+.fw-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.fw-btn{background:#0f172a;border:2px solid #334155;border-radius:10px;padding:14px;text-align:center;cursor:pointer;transition:all .2s}
+.fw-btn:hover{border-color:#475569}.fw-btn.active{border-color:#3b82f6;background:#1e293b}
+.fw-btn .icon{font-size:28px;margin-bottom:4px}.fw-btn .name{font-size:13px;font-weight:600;color:#f8fafc}.fw-btn .desc{font-size:11px;color:#64748b;margin-top:2px}
+pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;overflow-x:auto;font-size:12px;line-height:1.6;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospace;position:relative;margin-top:8px}
+.copy-btn{position:absolute;top:8px;right:8px;background:#3b82f6;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600}
+.copy-btn:hover{background:#2563eb}
+.code-header{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+.code-header span{color:#64748b;font-size:12px;font-family:monospace}
+.tag{display:inline-block;background:#22c55e;color:#fff;font-size:10px;font-weight:600;padding:2px 6px;border-radius:3px;margin-left:6px}
+.test-box{background:#064e3b;border:1px solid #059669;border-radius:8px;padding:14px;margin-top:16px}
+.test-box h4{color:#22c55e;font-size:13px;margin-bottom:6px}
+.test-box code{color:#6ee7b7;font-size:12px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <img src="https://www.vnoc.com/images/logo/logo-vnoc-with-ecorp-forwhite.svg" alt="VNOC" style="height:28px">
+  <h1>Install Error Hub Client</h1>
+  <a href="/">← Back to Dashboard</a>
+</div>
+<div class="cnt">
+  <h2>Add Error Logging in 2 Minutes</h2>
+  <p class="sub">Pick your framework, paste the file, and every error from your API automatically flows into log.vnoc.com.</p>
+
+  <div class="step">
+    <h3><span class="num">1</span> Project Name</h3>
+    <label>API Source Identifier (e.g. api-myproject)</label>
+    <input id="projName" placeholder="api-myproject" value="" oninput="gen()">
+  </div>
+
+  <div class="step">
+    <h3><span class="num">2</span> Framework</h3>
+    <div class="fw-row">
+      <div class="fw-btn active" onclick="selFw('nextjs',this)">
+        <div class="icon">▲</div><div class="name">Next.js</div><div class="desc">App Router (src/lib/)</div>
+      </div>
+      <div class="fw-btn" onclick="selFw('worker',this)">
+        <div class="icon">⚡</div><div class="name">CF Worker</div><div class="desc">Cloudflare Workers</div>
+      </div>
+      <div class="fw-btn" onclick="selFw('generic',this)">
+        <div class="icon">📦</div><div class="name">Generic</div><div class="desc">Any Node / JS runtime</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <h3><span class="num">3</span> Copy & Paste <span class="tag">auto-generated</span></h3>
+    <div id="output"></div>
+  </div>
+
+  <div class="step">
+    <h3><span class="num">4</span> Wire Up Your Routes</h3>
+    <div id="usage"></div>
+  </div>
+
+  <div class="test-box">
+    <h4>✅ Test It</h4>
+    <p style="color:#d1fae5;font-size:13px;margin-bottom:8px">After deploying, send a test error:</p>
+    <code id="testCmd">curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -d '{"api_source":"api-myproject","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}'</code>
+  </div>
+</div>
+
+<script>
+let fw='nextjs';
+function selFw(f,el){fw=f;document.querySelectorAll('.fw-btn').forEach(b=>b.classList.remove('active'));el.classList.add('active');gen()}
+
+function gen(){
+const name=document.getElementById('projName').value.trim()||'api-myproject';
+document.getElementById('testCmd').textContent='curl -X POST https://log.vnoc.com/ingest -H "Content-Type: application/json" -d \\'{"api_source":"'+name+'","errors":[{"error_type":"test","endpoint":"/test","method":"GET","message":"Test error from install page"}]}\\'';
+
+if(fw==='nextjs'){
+document.getElementById('output').innerHTML=codeBlock('src/lib/error-hub.ts',\`const HUB_URL = process.env.ERROR_HUB_URL || "https://log.vnoc.com";
+const API_SOURCE = process.env.ERROR_HUB_SOURCE || "\${name}";
+
+interface HubError {
+  error_type: string;
+  endpoint: string;
+  method: string;
+  message: string;
+  ip?: string;
+  user_agent?: string;
+  query_params?: string;
+  domain?: string;
+}
+
+export function sendToHub(entry: HubError): void {
+  if (!HUB_URL) return;
+  fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
+  }).catch(() => {});
+}
+
+export function hubErrorFromRequest(
+  req: Request, errorType: string, message: string
+): HubError {
+  let refDomain = "";
+  try {
+    const ref = req.headers.get("referer");
+    if (ref) refDomain = new URL(ref).hostname;
+  } catch {}
+  const url = new URL(req.url);
+  return {
+    error_type: errorType,
+    endpoint: url.pathname,
+    method: req.method,
+    message,
+    ip: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "",
+    user_agent: (req.headers.get("user-agent") || "").substring(0, 500),
+    query_params: url.search.substring(0, 2000),
+    domain: refDomain,
+  };
+}
+
+/** Wraps a route handler with automatic error catching */
+export function safe(
+  handler: (req: Request, ctx?: any) => Promise<Response>
+): (req: Request, ctx?: any) => Promise<Response> {
+  return async (req, ctx) => {
+    try {
+      return await handler(req, ctx);
+    } catch (err: any) {
+      sendToHub(hubErrorFromRequest(req, "internal_error", err?.message || "Unknown error"));
+      console.error("[error]", req.method, new URL(req.url).pathname, err);
+      return Response.json(
+        { success: false, message: "Internal server error" },
+        { status: 500, headers: { "Access-Control-Allow-Origin": "*" } }
+      );
+    }
+  };
+}\`);
+
+document.getElementById('usage').innerHTML=\`<p style="color:#94a3b8;font-size:13px;margin-bottom:8px">Import in your route handlers:</p>\`+codeBlock('Example: src/app/api/route.ts',\`import { sendToHub, hubErrorFromRequest, safe } from "@/lib/error-hub";
+
+// Option A: Use the safe() wrapper (recommended)
+export const GET = safe(async function GET(req: Request) {
+  // your handler code...
+  return Response.json({ success: true });
+});
+
+// Option B: Manual sendToHub
+export async function POST(req: Request) {
+  try {
+    // your handler code...
+    return Response.json({ success: true });
+  } catch (err: any) {
+    sendToHub(hubErrorFromRequest(req, "internal_error", err.message));
+    return Response.json({ success: false }, { status: 500 });
+  }
+}\`)+\`<p style="color:#94a3b8;font-size:13px;margin-top:12px">Optional: add to <code style="color:#e2e8f0">.env.local</code></p>\`+codeBlock('.env.local',\`ERROR_HUB_URL=https://log.vnoc.com
+ERROR_HUB_SOURCE=\${name}\`);
+
+}else if(fw==='worker'){
+document.getElementById('output').innerHTML=codeBlock('src/error-hub.ts',\`const HUB_URL = "https://log.vnoc.com";
+const API_SOURCE = "\${name}";
+
+interface HubError {
+  error_type: string;
+  endpoint: string;
+  method: string;
+  message: string;
+  ip?: string;
+  user_agent?: string;
+  query_params?: string;
+  domain?: string;
+}
+
+export function sendToHub(entry: HubError): void {
+  fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
+  }).catch(() => {});
+}
+
+export function hubErrorFromRequest(
+  req: Request, errorType: string, message: string
+): HubError {
+  const url = new URL(req.url);
+  let refDomain = "";
+  try {
+    const ref = req.headers.get("referer");
+    if (ref) refDomain = new URL(ref).hostname;
+  } catch {}
+  return {
+    error_type: errorType,
+    endpoint: url.pathname,
+    method: req.method,
+    message,
+    ip: req.headers.get("cf-connecting-ip") || "",
+    user_agent: (req.headers.get("user-agent") || "").substring(0, 500),
+    query_params: url.search.substring(0, 2000),
+    domain: refDomain,
+  };
+}\`);
+
+document.getElementById('usage').innerHTML=\`<p style="color:#94a3b8;font-size:13px;margin-bottom:8px">Import in your worker fetch handler:</p>\`+codeBlock('src/index.ts',\`import { sendToHub, hubErrorFromRequest } from "./error-hub";
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      // your routes...
+      return new Response("OK");
+    } catch (err: any) {
+      sendToHub(hubErrorFromRequest(request, "internal_error", err.message));
+      return new Response("Internal error", { status: 500 });
+    }
+  }
+};\`);
+
+}else{
+document.getElementById('output').innerHTML=codeBlock('lib/error-hub.js',\`const HUB_URL = process.env.ERROR_HUB_URL || "https://log.vnoc.com";
+const API_SOURCE = process.env.ERROR_HUB_SOURCE || "\${name}";
+
+async function sendToHub(entry) {
+  try {
+    await fetch(\\\`\\\${HUB_URL}/ingest\\\`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_source: API_SOURCE, errors: [entry] }),
+    });
+  } catch {}
+}
+
+function hubError(endpoint, method, errorType, message) {
+  return { error_type: errorType, endpoint, method, message };
+}
+
+module.exports = { sendToHub, hubError };\`);
+
+document.getElementById('usage').innerHTML=\`<p style="color:#94a3b8;font-size:13px;margin-bottom:8px">Import and use:</p>\`+codeBlock('Example usage',\`const { sendToHub, hubError } = require("./lib/error-hub");
+
+// In your error handler:
+app.use((err, req, res, next) => {
+  sendToHub(hubError(req.path, req.method, "internal_error", err.message));
+  res.status(500).json({ error: "Internal server error" });
+});\`);
+}
+}
+
+function codeBlock(file,code){
+return '<div class="code-header"><span>'+esc(file)+'</span></div><pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>'+esc(code)+'</pre>';
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function copyCode(btn){const pre=btn.parentElement;const t=pre.textContent.replace('Copy','').trim();navigator.clipboard.writeText(t);btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1500)}
+
+gen();
+</script>
+</body></html>`;
+}
 
 // ── GET / — Dashboard HTML ──────────────────────────────────────────────────
 
@@ -335,7 +681,7 @@ function dashboardHTML(): string {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>log.vnoc.com — VentureOS Error Hub</title>
+<title>log.vnoc.com — VNOC Error Hub</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -380,6 +726,24 @@ tr:hover td{background:#334155}
 #toast{position:fixed;bottom:20px;right:20px;background:#22c55e;color:#fff;padding:10px 20px;border-radius:8px;display:none;font-weight:500;z-index:100;font-size:13px}
 .tab-row{display:flex;gap:2px;margin-bottom:12px}.tab-btn{padding:6px 14px;border-radius:6px 6px 0 0;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-bottom:none;cursor:pointer;font-size:12px;font-weight:500}
 .tab-btn.active{background:#334155;color:#f8fafc}
+.ai-btn{background:#7c3aed;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px;font-weight:600;white-space:nowrap}
+.ai-btn:hover{background:#6d28d9}.ai-btn:disabled{opacity:.5;cursor:wait}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:200;align-items:center;justify-content:center}
+.modal-bg.show{display:flex}
+.modal{background:#1e293b;border:1px solid #475569;border-radius:12px;max-width:600px;width:90%;max-height:80vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-hdr{padding:16px 20px;border-bottom:1px solid #334155;display:flex;align-items:center;gap:10px}
+.modal-hdr h3{font-size:16px;color:#f8fafc;flex:1}.modal-close{background:none;border:none;color:#94a3b8;font-size:20px;cursor:pointer}
+.modal-body{padding:20px}
+.ai-section{margin-bottom:16px}
+.ai-section h4{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.ai-section p{font-size:14px;line-height:1.6;color:#e2e8f0}
+.sev-badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase}
+.sev-critical{background:#dc2626;color:#fff}.sev-high{background:#ea580c;color:#fff}.sev-medium{background:#d97706;color:#fff}.sev-low{background:#059669;color:#fff}
+.ai-loading{text-align:center;padding:40px;color:#94a3b8}
+.ai-loading .spinner{display:inline-block;width:24px;height:24px;border:3px solid #334155;border-top:3px solid #7c3aed;border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ai-error-ctx{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px;margin-bottom:16px;font-size:12px;color:#94a3b8}
+.ai-error-ctx span{color:#e2e8f0}
 </style>
 </head>
 <body>
@@ -388,8 +752,9 @@ tr:hover td{background:#334155}
   <h1>log.vnoc.com</h1>
   <span class="badge" id="totalBadge">—</span>
   <div class="rt">
+    <a href="/install" class="btn btn-ghost" title="Add a new project" style="text-decoration:none">🔌 Install</a>
     <button class="btn btn-green" onclick="sendDigest()" title="Send email digest now">📧 Send Digest</button>
-    <span class="sub">VentureOS Error Hub</span>
+    <span class="sub">VNOC Error Hub</span>
   </div>
 </div>
 <div class="cnt">
@@ -416,6 +781,11 @@ tr:hover td{background:#334155}
     <div class="pg"><button id="prevB" onclick="pg(-1)" disabled>&laquo;</button><span id="pgInfo" style="color:#64748b;padding:4px 8px;font-size:12px"></span><button id="nextB" onclick="pg(1)" disabled>&raquo;</button></div>
   </div>
 </div>
+<div class="modal-bg" id="aiModal" onclick="if(event.target===this)closeAI()">
+<div class="modal">
+<div class="modal-hdr"><span style="font-size:20px">🤖</span><h3>AI Error Analysis</h3><button class="modal-close" onclick="closeAI()">&times;</button></div>
+<div class="modal-body" id="aiBody"><div class="ai-loading"><div class="spinner"></div><p style="margin-top:10px">Analyzing error with AI...</p></div></div>
+</div></div>
 <div id="toast"></div>
 <script>
 const B=location.origin;let off=0,tot=0,tab='logs';const L=50;
@@ -435,12 +805,12 @@ document.getElementById('domTags').innerHTML=(d.by_domain||[]).slice(0,12).map(r
 async function load(){if(tab==='summary')return loadSum();const src=document.getElementById('fSrc').value,ty=document.getElementById('fType').value,ep=document.getElementById('fEp').value,dom=document.getElementById('fDom').value,s=document.getElementById('fSearch').value;
 let q='?limit='+L+'&offset='+off;if(src)q+='&source='+encodeURIComponent(src);if(ty)q+='&type='+encodeURIComponent(ty);if(ep)q+='&endpoint='+encodeURIComponent(ep);if(dom)q+='&domain='+encodeURIComponent(dom);if(s)q+='&search='+encodeURIComponent(s);
 const d=await F('/logs'+q);if(!d.success)return;tot=d.total;
-document.getElementById('th').innerHTML='<tr><th>Time</th><th>Source</th><th>Type</th><th>Method</th><th>Endpoint</th><th>Message</th><th>Domain</th><th>IP</th></tr>';
-document.getElementById('tb').innerHTML=(d.logs||[]).map(l=>'<tr><td style="white-space:nowrap;color:#64748b">'+(l.created_at||'').replace('T',' ').substring(0,19)+'</td><td><span class="st">'+esc(l.api_source)+'</span></td><td><span class="bt '+bc(l.error_type)+'">'+esc(l.error_type)+'</span></td><td>'+esc(l.method)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.endpoint)+'">'+esc(l.endpoint)+'</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8" title="'+esc(l.message)+'">'+esc(l.message)+'</td><td style="color:#a855f7;font-size:11px">'+esc(l.domain)+'</td><td style="color:#64748b;font-size:11px">'+esc(l.ip)+'</td></tr>').join('')||'<tr><td colspan="8" class="empty">No errors found</td></tr>';
+document.getElementById('th').innerHTML='<tr><th>Time</th><th>Source</th><th>Type</th><th>Method</th><th>Endpoint</th><th>Message</th><th>Domain</th><th>IP</th><th style="width:60px">AI</th></tr>';
+document.getElementById('tb').innerHTML=(d.logs||[]).map(l=>'<tr><td style="white-space:nowrap;color:#64748b">'+(l.created_at||'').replace('T',' ').substring(0,19)+'</td><td><span class="st">'+esc(l.api_source)+'</span></td><td><span class="bt '+bc(l.error_type)+'">'+esc(l.error_type)+'</span></td><td>'+esc(l.method)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.endpoint)+'">'+esc(l.endpoint)+'</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8" title="'+esc(l.message)+'">'+esc(l.message)+'</td><td style="color:#a855f7;font-size:11px">'+esc(l.domain)+'</td><td style="color:#64748b;font-size:11px">'+esc(l.ip)+'</td><td><button class="ai-btn" onclick="analyzeErr(this)" data-src="'+esc(l.api_source)+'" data-type="'+esc(l.error_type)+'" data-ep="'+esc(l.endpoint)+'" data-method="'+esc(l.method)+'" data-msg="'+esc(l.message)+'" data-ua="'+esc(l.user_agent)+'" data-qp="'+esc(l.query_params)+'">🤖</button></td></tr>').join('')||'<tr><td colspan="9" class="empty">No errors found</td></tr>';
 upPg();stats()}
 async function loadSum(){const src=document.getElementById('fSrc').value;const d=await F('/summary?hours=24'+(src?'&source='+src:''));if(!d.success)return;
 document.getElementById('th').innerHTML='<tr><th>Source</th><th>Endpoint</th><th>Type</th><th>Hits</th><th>Last Seen</th></tr>';
-document.getElementById('tb').innerHTML=(d.top_endpoints||[]).map(r=>'<tr><td><span class="st">'+esc(r.api_source)+'</span></td><td>'+esc(r.endpoint)+'</td><td><span class="bt '+bc(r.error_type)+'">'+esc(r.error_type)+'</span></td><td style="font-weight:700">'+r.count+'</td><td style="color:#64748b">'+(r.last_seen||'').replace('T',' ').substring(0,19)+'</td></tr>').join('')||'<tr><td colspan="5" class="empty">No data</td></tr>';
+document.getElementById('tb').innerHTML=(d.top_endpoints||[]).map(r=>'<tr><td><span class="st">'+esc(r.api_source)+'</span></td><td>'+esc(r.endpoint)+'</td><td><span class="bt '+bc(r.error_type)+'">'+esc(r.error_type)+'</span></td><td style="font-weight:700">'+r.count+'</td><td style="color:#64748b">'+(r.last_seen||'').replace('T',' ').substring(0,19)+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">No data</td></tr>';
 document.getElementById('prevB').disabled=document.getElementById('nextB').disabled=true;document.getElementById('pgInfo').textContent=(d.top_endpoints||[]).length+' grouped endpoints'}
 function switchTab(t){tab=t;document.getElementById('tabLogs').className='tab-btn'+(t==='logs'?' active':'');document.getElementById('tabSummary').className='tab-btn'+(t==='summary'?' active':'');off=0;load()}
 function upPg(){const p=Math.floor(off/L)+1,tp=Math.ceil(tot/L);document.getElementById('pgInfo').textContent='Page '+p+'/'+tp+' ('+tot+')';document.getElementById('prevB').disabled=off===0;document.getElementById('nextB').disabled=off+L>=tot}
@@ -448,6 +818,29 @@ function pg(d){off=Math.max(0,off+d*L);load()}
 async function clearL(){const src=document.getElementById('fSrc').value;if(!src){toast('Select a source','#d97706');return}if(!confirm('Clear all logs for '+src+'?'))return;const d=await F('/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:src})});if(d.success){toast('Cleared '+d.deleted);off=0;load()}else toast(d.error||'Failed','#ef4444')}
 async function sendDigest(){if(!confirm('Send error digest email now?'))return;const d=await F('/send-digest',{method:'POST'});toast(d.message||'Done',d.success?'#22c55e':'#ef4444')}
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+async function analyzeErr(btn){
+const data={api_source:btn.dataset.src,error_type:btn.dataset.type,endpoint:btn.dataset.ep,method:btn.dataset.method,message:btn.dataset.msg,user_agent:btn.dataset.ua,query_params:btn.dataset.qp};
+document.getElementById('aiModal').classList.add('show');
+document.getElementById('aiBody').innerHTML='<div class="ai-loading"><div class="spinner"></div><p style="margin-top:10px">Analyzing error with AI...</p></div>';
+btn.disabled=true;btn.textContent='...';
+try{
+const r=await F('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+if(r.success&&r.analysis){
+const a=r.analysis;const sevClass='sev-'+(a.severity||'medium');
+document.getElementById('aiBody').innerHTML=
+'<div class="ai-error-ctx"><b>Error:</b> <span>'+esc(data.message)+'</span><br><b>Source:</b> <span>'+esc(data.api_source)+'</span> &middot; <b>Endpoint:</b> <span>'+esc(data.method)+' '+esc(data.endpoint)+'</span> &middot; <b>Type:</b> <span>'+esc(data.error_type)+'</span></div>'+
+'<div class="ai-section"><h4>Severity</h4><span class="sev-badge '+sevClass+'">'+esc(a.severity||'medium')+'</span>'+(a.category?' <span style="color:#94a3b8;font-size:12px;margin-left:8px">'+esc(a.category)+'</span>':'')+'</div>'+
+'<div class="ai-section"><h4>Diagnosis</h4><p>'+esc(a.diagnosis)+'</p></div>'+
+'<div class="ai-section"><h4>Suggested Fix</h4><p>'+esc(a.suggested_fix)+'</p></div>';
+}else{
+document.getElementById('aiBody').innerHTML='<div class="ai-loading" style="color:#ef4444"><p>'+esc(r.error||'Analysis failed')+'</p></div>';
+}
+}catch(e){
+document.getElementById('aiBody').innerHTML='<div class="ai-loading" style="color:#ef4444"><p>Failed to reach AI: '+esc(e.message)+'</p></div>';
+}
+btn.disabled=false;btn.textContent='🤖';
+}
+function closeAI(){document.getElementById('aiModal').classList.remove('show')}
 init();
 </script></body></html>`;
 }

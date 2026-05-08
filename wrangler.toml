@@ -13,8 +13,11 @@ VNOC_API_URL = "https://manage.vnoc.com"
 VNOC_API_KEY = "b102e32a4bf14b575f352186e265ed7c7272cde4ded39f0c478530f6b358c9c4"
 # Resend for email alerts
 RESEND_API_KEY = "re_fBcrxGWe_Q22pnqbFd9euHVh8DNRfZag4"
-RESEND_FROM = "VentureOS Error Hub <noreply@vnoc.com>"
+RESEND_FROM = "VNOC Error Hub <noreply@send.vnoc.com>"
 ALERT_RECIPIENTS = "maida@vnoc.com,kjabellar@gmail.com,rownone@gmail.com"
+
+[ai]
+binding = "AI"
 
 [[d1_databases]]
 binding = "DB"
