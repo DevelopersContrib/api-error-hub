@@ -20,6 +20,7 @@
  *   SESSION (magic link cookie):
  *     GET  /                — Dashboard HTML
  *     GET  /logs            — Query raw logs
+ *     GET  /groups          — Deduplicated smart error groups
  *     GET  /summary         — Aggregated stats
  *     GET  /sources         — List API sources
  *     POST /clear           — Clear logs
@@ -85,6 +86,7 @@ export default {
       }
 
       if (path === "/logs") return handleLogs(url, env, request);
+      if (path === "/groups") return handleGroups(url, env);
       if (path === "/summary") return handleSummary(url, env, request);
       if (path === "/sources") return handleSources(env, request);
       if (path === "/clear" && request.method === "POST") return handleClear(request, env);
@@ -361,6 +363,60 @@ async function handleLogs(url: URL, env: Env, req: Request): Promise<Response> {
   const rows = await env.DB.prepare(`SELECT * FROM error_logs WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(...p, limit, offset).all();
 
   return json({ success: true, total: cnt?.total||0, limit, offset, logs: rows.results });
+}
+
+// ── GET /groups — Smart Deduplicated Error Groups ──────────────────────────
+
+async function handleGroups(url: URL, env: Env): Promise<Response> {
+  const source = url.searchParams.get("source") || "";
+  const errorType = url.searchParams.get("type") || "";
+  const hours = parseInt(url.searchParams.get("hours") || "24");
+  const since = new Date(Date.now() - hours * 3600000).toISOString();
+
+  let where = "created_at >= ?"; const p: any[] = [since];
+  if (source) { where += " AND api_source = ?"; p.push(source); }
+  if (errorType) { where += " AND error_type = ?"; p.push(errorType); }
+
+  // Group by pattern: source + endpoint + method + error_type + message signature
+  // Message signature = first 80 chars (strips variable IDs/timestamps to cluster similar errors)
+  const groups = await env.DB.prepare(`
+    SELECT
+      api_source,
+      endpoint,
+      method,
+      error_type,
+      SUBSTR(message, 1, 80) as message_pattern,
+      COUNT(*) as count,
+      COUNT(DISTINCT domain) as unique_domains,
+      COUNT(DISTINCT ip) as unique_ips,
+      MIN(created_at) as first_seen,
+      MAX(created_at) as last_seen,
+      MAX(message) as sample_message,
+      MAX(domain) as sample_domain
+    FROM error_logs
+    WHERE ${where}
+    GROUP BY api_source, endpoint, method, error_type, SUBSTR(message, 1, 80)
+    ORDER BY count DESC
+    LIMIT 100
+  `).bind(...p).all();
+
+  // Also get a mini-histogram per group (last 24h, hourly) for top groups
+  // This would be expensive per-group, so we'll do overall totals
+  const totalRaw = await env.DB.prepare(`SELECT COUNT(*) as total FROM error_logs WHERE ${where}`).bind(...p).first<{total:number}>();
+  const uniquePatterns = (groups.results || []).length;
+  const totalRawCount = totalRaw?.total || 0;
+
+  // Compute dedup ratio
+  const dedupRatio = totalRawCount > 0 ? Math.round((1 - uniquePatterns / totalRawCount) * 100) : 0;
+
+  return json({
+    success: true,
+    hours,
+    total_raw: totalRawCount,
+    unique_patterns: uniquePatterns,
+    dedup_ratio: dedupRatio,
+    groups: groups.results,
+  });
 }
 
 // ── GET /summary ────────────────────────────────────────────────────────────
@@ -1465,6 +1521,16 @@ tr:hover td{background:#334155}
 .tab-btn.active{background:#334155;color:#f8fafc}
 .ai-btn{display:inline-block;background:#7c3aed;color:#fff;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;white-space:nowrap;text-align:center}
 .ai-btn:hover{background:#6d28d9}
+.cnt-badge{display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:700;color:#fff}
+.cnt-badge.hot{background:linear-gradient(135deg,#dc2626,#ea580c)}.cnt-badge.warm{background:linear-gradient(135deg,#d97706,#ca8a04)}.cnt-badge.cool{background:#334155;color:#94a3b8}
+.grp-bar{height:4px;border-radius:2px;margin-top:3px;background:#1e293b;overflow:hidden}
+.grp-bar-fill{height:100%;border-radius:2px;transition:width .3s}
+.grp-meta{display:flex;gap:8px;font-size:10px;color:#64748b;margin-top:2px}
+.grp-meta span{display:flex;align-items:center;gap:2px}
+.dedup-card{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px}
+.dedup-card .pct{font-size:22px;font-weight:700;color:#22c55e}.dedup-card .lb{color:#94a3b8;font-size:11px}
+.drill-btn{background:none;border:none;color:#3b82f6;cursor:pointer;font-size:11px;text-decoration:underline;padding:0}
+.drill-btn:hover{color:#60a5fa}
 </style>
 </head>
 <body>
@@ -1495,7 +1561,8 @@ tr:hover td{background:#334155}
       <input id="fSearch" placeholder="Search message...">
       <button class="btn" onclick="load()">Filter</button>
       <div class="tab-row" style="margin-left:8px">
-        <button class="tab-btn active" id="tabLogs" onclick="switchTab('logs')">Logs</button>
+        <button class="tab-btn active" id="tabGrouped" onclick="switchTab('grouped')">Grouped</button>
+        <button class="tab-btn" id="tabLogs" onclick="switchTab('logs')">Logs</button>
         <button class="tab-btn" id="tabSummary" onclick="switchTab('summary')">Summary</button>
       </div>
       <button class="btn btn-red" onclick="clearL()" style="margin-left:auto">Clear Source</button>
@@ -1506,9 +1573,10 @@ tr:hover td{background:#334155}
 </div>
 <div id="toast"></div>
 <script>
-const B=location.origin;let off=0,tot=0,tab='logs';const L=50;
+const B=location.origin;let off=0,tot=0,tab='grouped';const L=50;
 function toast(m,c='#22c55e'){const t=document.getElementById('toast');t.textContent=m;t.style.background=c;t.style.display='block';setTimeout(()=>t.style.display='none',3000)}
 function bc(t){return t==='error'||t==='internal_error'?'bt-err':t==='404'?'bt-404':t==='auth'?'bt-auth':t==='validation'?'bt-val':'bt-unk'}
+function cntCls(n){return n>=20?'hot':n>=5?'warm':'cool'}
 async function F(p,o={}){return(await fetch(B+p,o)).json()}
 async function init(){try{const d=await F('/sources');const s=document.getElementById('fSrc');s.innerHTML='<option value="">All Sources</option>';(d.sources||[]).forEach(r=>{const o=document.createElement('option');o.value=r.api_source;o.textContent=r.api_source+' ('+r.total+')';s.appendChild(o)});await Promise.all([stats(),load()])}catch(e){toast('Failed to load','#ef4444')}}
 async function stats(){const src=document.getElementById('fSrc').value;const d=await F('/summary?hours=24'+(src?'&source='+src:''));if(!d.success)return;document.getElementById('totalBadge').textContent=d.total+' errors';
@@ -1520,17 +1588,52 @@ document.getElementById('statsRow').innerHTML='<div class="card"><div class="lb"
 const h=d.histogram||[];const mx=Math.max(...h.map(x=>x.count),1);
 document.getElementById('hist').innerHTML=h.map(x=>'<div class="bar" style="height:'+Math.max((x.count/mx)*100,4)+'%" title="'+x.hour+': '+x.count+'"></div>').join('');
 document.getElementById('domTags').innerHTML=(d.by_domain||[]).slice(0,12).map(r=>'<span class="dom-tag"><b>'+esc(r.domain)+'</b> '+r.count+'</span>').join('')||(('<span class="dom-tag">No domain data</span>'))}
-async function load(){if(tab==='summary')return loadSum();const src=document.getElementById('fSrc').value,ty=document.getElementById('fType').value,ep=document.getElementById('fEp').value,dom=document.getElementById('fDom').value,s=document.getElementById('fSearch').value;
+async function load(){
+if(tab==='grouped')return loadGroups();
+if(tab==='summary')return loadSum();
+const src=document.getElementById('fSrc').value,ty=document.getElementById('fType').value,ep=document.getElementById('fEp').value,dom=document.getElementById('fDom').value,s=document.getElementById('fSearch').value;
 let q='?limit='+L+'&offset='+off;if(src)q+='&source='+encodeURIComponent(src);if(ty)q+='&type='+encodeURIComponent(ty);if(ep)q+='&endpoint='+encodeURIComponent(ep);if(dom)q+='&domain='+encodeURIComponent(dom);if(s)q+='&search='+encodeURIComponent(s);
 const d=await F('/logs'+q);if(!d.success)return;tot=d.total;
 document.getElementById('th').innerHTML='<tr><th>Time</th><th>Source</th><th>Type</th><th>Method</th><th>Endpoint</th><th>Message</th><th>Domain</th><th>IP</th><th style="width:60px">AI</th></tr>';
 document.getElementById('tb').innerHTML=(d.logs||[]).map(l=>'<tr><td style="white-space:nowrap;color:#64748b">'+(l.created_at||'').replace('T',' ').substring(0,19)+'</td><td><span class="st">'+esc(l.api_source)+'</span></td><td><span class="bt '+bc(l.error_type)+'">'+esc(l.error_type)+'</span></td><td>'+esc(l.method)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.endpoint)+'">'+esc(l.endpoint)+'</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8" title="'+esc(l.message)+'">'+esc(l.message)+'</td><td style="color:#a855f7;font-size:11px">'+esc(l.domain)+'</td><td style="color:#64748b;font-size:11px">'+esc(l.ip)+'</td><td><a class="ai-btn" href="/agent?src='+encodeURIComponent(l.api_source||'')+'&type='+encodeURIComponent(l.error_type||'')+'&ep='+encodeURIComponent(l.endpoint||'')+'&method='+encodeURIComponent(l.method||'')+'&msg='+encodeURIComponent((l.message||'').substring(0,200))+'" target="_blank" style="text-decoration:none">🤖</a></td></tr>').join('')||'<tr><td colspan="9" class="empty">No errors found</td></tr>';
 upPg();stats()}
+async function loadGroups(){
+const src=document.getElementById('fSrc').value,ty=document.getElementById('fType').value;
+let q='?hours=24';if(src)q+='&source='+encodeURIComponent(src);if(ty)q+='&type='+encodeURIComponent(ty);
+const d=await F('/groups'+q);if(!d.success)return;
+const groups=d.groups||[];const mx=groups.length?groups[0].count:1;
+document.getElementById('th').innerHTML='<tr><th style="width:70px">Count</th><th>Source</th><th>Type</th><th>Method</th><th>Endpoint</th><th>Message Pattern</th><th style="width:80px">Scope</th><th style="width:140px">Time Range</th><th style="width:80px">Actions</th></tr>';
+document.getElementById('tb').innerHTML=groups.map(g=>{
+const pct=Math.round((g.count/mx)*100);
+const barColor=g.error_type==='error'||g.error_type==='internal_error'?'#ef4444':g.error_type==='404'?'#eab308':'#3b82f6';
+const first=(g.first_seen||'').replace('T',' ').substring(5,16);
+const last=(g.last_seen||'').replace('T',' ').substring(5,16);
+const timeRange=first===last?last:first+' → '+last;
+return '<tr><td><span class="cnt-badge '+cntCls(g.count)+'">'+g.count+'×</span><div class="grp-bar"><div class="grp-bar-fill" style="width:'+pct+'%;background:'+barColor+'"></div></div></td>'+
+'<td><span class="st">'+esc(g.api_source)+'</span></td>'+
+'<td><span class="bt '+bc(g.error_type)+'">'+esc(g.error_type)+'</span></td>'+
+'<td>'+esc(g.method)+'</td>'+
+'<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="'+esc(g.endpoint)+'">'+esc(g.endpoint)+'</td>'+
+'<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;color:#94a3b8;font-size:11px" title="'+esc(g.sample_message)+'">'+esc(g.sample_message)+'</td>'+
+'<td><div class="grp-meta"><span>🌐 '+g.unique_domains+'</span><span>👤 '+g.unique_ips+'</span></div></td>'+
+'<td style="color:#64748b;font-size:10px;white-space:nowrap">'+timeRange+'</td>'+
+'<td><button class="drill-btn" onclick="drillDown(\\''+esc(g.api_source)+'\\',\\''+esc(g.endpoint)+'\\',\\''+esc(g.error_type)+'\\')">View logs</button> '+
+'<a class="ai-btn" href="/agent?src='+encodeURIComponent(g.api_source||'')+'&type='+encodeURIComponent(g.error_type||'')+'&ep='+encodeURIComponent(g.endpoint||'')+'&method='+encodeURIComponent(g.method||'')+'&msg='+encodeURIComponent((g.sample_message||'').substring(0,200))+'" target="_blank" style="text-decoration:none">🤖</a></td></tr>';
+}).join('')||'<tr><td colspan="9" class="empty">No error patterns found</td></tr>';
+document.getElementById('prevB').disabled=document.getElementById('nextB').disabled=true;
+document.getElementById('pgInfo').textContent=d.unique_patterns+' patterns from '+d.total_raw+' errors ('+d.dedup_ratio+'% dedup)';
+stats()}
+function drillDown(src,ep,typ){
+document.getElementById('fSrc').value=src;
+document.getElementById('fEp').value=ep;
+document.getElementById('fType').value=typ;
+switchTab('logs');
+}
 async function loadSum(){const src=document.getElementById('fSrc').value;const d=await F('/summary?hours=24'+(src?'&source='+src:''));if(!d.success)return;
 document.getElementById('th').innerHTML='<tr><th>Source</th><th>Endpoint</th><th>Type</th><th>Hits</th><th>Last Seen</th></tr>';
 document.getElementById('tb').innerHTML=(d.top_endpoints||[]).map(r=>'<tr><td><span class="st">'+esc(r.api_source)+'</span></td><td>'+esc(r.endpoint)+'</td><td><span class="bt '+bc(r.error_type)+'">'+esc(r.error_type)+'</span></td><td style="font-weight:700">'+r.count+'</td><td style="color:#64748b">'+(r.last_seen||'').replace('T',' ').substring(0,19)+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">No data</td></tr>';
 document.getElementById('prevB').disabled=document.getElementById('nextB').disabled=true;document.getElementById('pgInfo').textContent=(d.top_endpoints||[]).length+' grouped endpoints'}
-function switchTab(t){tab=t;document.getElementById('tabLogs').className='tab-btn'+(t==='logs'?' active':'');document.getElementById('tabSummary').className='tab-btn'+(t==='summary'?' active':'');off=0;load()}
+function switchTab(t){tab=t;document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));const el=document.getElementById('tab'+t.charAt(0).toUpperCase()+t.slice(1));if(el)el.classList.add('active');off=0;load()}
 function upPg(){const p=Math.floor(off/L)+1,tp=Math.ceil(tot/L);document.getElementById('pgInfo').textContent='Page '+p+'/'+tp+' ('+tot+')';document.getElementById('prevB').disabled=off===0;document.getElementById('nextB').disabled=off+L>=tot}
 function pg(d){off=Math.max(0,off+d*L);load()}
 async function clearL(){const src=document.getElementById('fSrc').value;if(!src){toast('Select a source','#d97706');return}if(!confirm('Clear all logs for '+src+'?'))return;const d=await F('/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:src})});if(d.success){toast('Cleared '+d.deleted);off=0;load()}else toast(d.error||'Failed','#ef4444')}
